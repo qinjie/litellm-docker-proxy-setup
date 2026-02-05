@@ -1,0 +1,44 @@
+model_list:
+  - model_name: claude-sonnet-4-5
+    litellm_params:
+      model: bedrock/global.anthropic.claude-sonnet-4-5-20250929-v1:0
+      aws_region_name: us-west-2
+      supports_prompt_caching: true # Enable prompt caching support
+  - model_name: claude-haiku-4-5
+    litellm_params:
+      model: bedrock/global.anthropic.claude-haiku-4-5-20251001-v1:0
+      aws_region_name: us-west-2
+      supports_prompt_caching: true # Enable prompt caching support
+  - model_name: claude-opus-4-5
+    litellm_params:
+      model: bedrock/global.anthropic.claude-opus-4-5-20251101-v1:0
+      aws_region_name: us-west-2
+      supports_prompt_caching: true # Enable prompt caching support
+
+litellm_settings: # module level litellm settings - https://github.com/BerriAI/litellm/blob/main/litellm/__init__.py
+  mcp_semantic_tool_filter:
+    enabled: true
+    embedding_model: "bedrock/cohere.embed-multilingual-v3:0:512"
+    top_k: 5
+    similarity_threshold: 0.3
+
+  drop_params: true
+  cache: true
+  cache_params:
+    type: local # in-memory cache (no extra deps required)
+    ttl: 3600
+    default_max_size: 1000 # max number of cached items
+
+  max_budget: 500 # (float) sets max budget as $0 USD
+  budget_duration: 1mo # (str) frequency of reset - You can set duration as seconds ("30s"), minutes ("30m"), hours ("30h"), days ("30d").
+  max_internal_user_budget: 500 # amount in USD for a month for a user
+  internal_user_budget_duration: "1mo" # reset every month
+  # Local JSON file logging
+  success_callback: ["json"]
+  failure_callback: ["json"]
+  json_logs:
+    log_file_path: /app/logs/litellm.log
+
+general_settings:
+  master_key: # [OPTIONAL] Only use this if you to require all calls to contain this key (Authorization: Bearer sk-1234)
+  # [Optional] The `db` is refer to the name of the database service in docker-compose.yml
