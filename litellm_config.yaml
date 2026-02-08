@@ -3,24 +3,30 @@ model_list:
     litellm_params:
       model: bedrock/global.anthropic.claude-sonnet-4-5-20250929-v1:0
       aws_region_name: us-west-2
-      supports_prompt_caching: true # Enable prompt caching support
   - model_name: claude-haiku-4-5
     litellm_params:
       model: bedrock/global.anthropic.claude-haiku-4-5-20251001-v1:0
       aws_region_name: us-west-2
-      supports_prompt_caching: true # Enable prompt caching support
   - model_name: claude-opus-4-5
     litellm_params:
       model: bedrock/global.anthropic.claude-opus-4-5-20251101-v1:0
       aws_region_name: us-west-2
-      supports_prompt_caching: true # Enable prompt caching support
+  - model_name: claude-opus-4-6
+    litellm_params:
+      model: bedrock/global.anthropic.claude-opus-4-6-v1
+      aws_region_name: us-west-2
+  - model_name: cohere.embed-v4
+    litellm_params:
+      model: bedrock/global.cohere.embed-v4:0
+      aws_region_name: us-west-2
 
 litellm_settings: # module level litellm settings - https://github.com/BerriAI/litellm/blob/main/litellm/__init__.py
-  mcp_semantic_tool_filter:
-    enabled: true
-    embedding_model: "bedrock/cohere.embed-multilingual-v3:0:512"
-    top_k: 5
-    similarity_threshold: 0.3
+  # Uncomment and configure if you need MCP semantic tool filtering
+  # mcp_semantic_tool_filter:
+  #   enabled: true
+  #   embedding_model: "cohere.embed-multilingual-v3"
+  #   top_k: 5
+  #   similarity_threshold: 0.3
 
   drop_params: true
   cache: true
