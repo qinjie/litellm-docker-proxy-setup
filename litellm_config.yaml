@@ -3,6 +3,10 @@ model_list:
     litellm_params:
       model: bedrock/global.anthropic.claude-sonnet-4-5-20250929-v1:0
       aws_region_name: us-west-2
+  - model_name: claude-sonnet-4-6
+    litellm_params:
+      model: bedrock/global.anthropic.claude-sonnet-4-6
+      aws_region_name: us-west-2
   - model_name: claude-haiku-4-5
     litellm_params:
       model: bedrock/global.anthropic.claude-haiku-4-5-20251001-v1:0
@@ -15,7 +19,7 @@ model_list:
     litellm_params:
       model: bedrock/global.anthropic.claude-opus-4-6-v1
       aws_region_name: us-west-2
-  - model_name: cohere.embed-v4
+  - model_name: global.cohere.embed-v4:0
     litellm_params:
       model: bedrock/global.cohere.embed-v4:0
       aws_region_name: us-west-2
