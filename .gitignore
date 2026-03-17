@@ -1,7 +1,9 @@
 # Environment variables
 .env
+.env.*
 *.env
 !.env.sample
+!.env.example
 
 # Docker volumes
 data/
