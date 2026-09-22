@@ -13,6 +13,23 @@ Refreshing the credentials themselves. A host-side script already owns that and
 writes `~/.env.aws`; this plan does not replace, schedule, or wrap it. No
 `launchd` agent is added.
 
+## Operating model
+
+Refresh is **human-driven and unscheduled** — the host script requires a person,
+so it cannot be run on a timer. Two consequences shape the design:
+
+- Credentials in `~/.env.aws` may be **expired for an unbounded period**, from
+  the moment they lapse until a person happens to refresh them. Requests during
+  that window cannot be rescued; no valid credentials exist.
+- The property that matters is therefore: **the first request issued after the
+  file is rewritten must succeed, with no restart and no operator action beyond
+  the refresh itself.** Latency is measured from the file changing, not from
+  expiry.
+
+The proxy must also not degrade during the expired window: it should keep
+failing cleanly per request and remain ready, rather than restart-looping or
+wedging itself.
+
 ## Findings in the current design
 
 Credentials reach litellm as process environment variables sourced at startup
@@ -83,29 +100,46 @@ tag. A future image could reintroduce caching on this path and silently
 regress it. The design must remain correct on Mechanism A alone; B is an
 optimisation, and the plan does not promise next-request pickup on its basis.
 
-### `Expiration` is required, and `~/.env.aws` lacks it
+### `Expiration` must be emitted, and must be capped short
 
 `~/.env.aws` contains only `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
 `AWS_SESSION_TOKEN`, `AWS_DEFAULT_REGION`. botocore's `ProcessProvider` treats a
 payload **without** `Expiration` as static, non-refreshable credentials — which
-would disable Mechanism A entirely and leave freshness resting solely on the
-un-contracted Mechanism B. The shim must therefore always emit one:
+disables Mechanism A entirely and leaves freshness resting on the un-contracted
+Mechanism B. So the shim must always emit one.
 
-- pass through `AWS_CREDENTIAL_EXPIRATION` when the host script provides it;
-- otherwise synthesize an expiry a short interval ahead, chosen to sit inside
-  the 15-minute advisory window so refresh is attempted continuously.
+**It must also always cap it.** The emitted value governs *when botocore next
+re-reads the file*, and is not a safety property — emitting an expiry earlier
+than the credential's true expiry only makes botocore re-read more often, which
+is precisely what is wanted. Emitting the real expiry is actively harmful here:
+these credentials carry a ~12h lifetime, far outside botocore's 15-minute
+advisory window, so botocore would not re-invoke the shim for roughly 11h45m. A
+file rewritten by hand inside that window would be missed for hours — defeating
+the entire purpose. Given the operating model above, a hand-edit landing in that
+window is the *expected* case, not an edge case.
+
+The shim therefore emits:
+
+```
+Expiration = min(AWS_CREDENTIAL_EXPIRATION if present, now + CAP)
+```
+
+with `CAP` short enough to sit inside the advisory window. The `min()` matters in
+both directions: the cap bounds how long a rewritten file can go unnoticed, and
+honouring a nearer real expiry avoids advertising validity the credentials do not
+have.
 
 Tradeoff to settle in implementation: botocore also has a 10-minute *mandatory*
-window, inside which a failed refresh raises instead of serving the existing
-credentials. A synthesized expiry short enough to force frequent refresh also
-sits in or near that window, so a transient unreadable file surfaces as a failed
-request rather than silent staleness. That is the preferable failure mode here,
-but the chosen interval must be recorded with its reasoning.
+window, inside which a failed refresh raises instead of serving existing
+credentials. A `CAP` short enough to force frequent re-reads sits in or near that
+window, so a transient unreadable file surfaces as a failed request rather than
+silent staleness — the preferable failure mode here. The chosen `CAP` must be
+recorded with its reasoning, and V2b measures the bound it actually delivers.
 
-Worth doing, though owned by the host script and not required by this plan: emit
+Optional, and purely diagnostic given the cap: the host script may emit
 `AWS_CREDENTIAL_EXPIRATION` (the `Expiration` that `isengardcli` already
-returns) into `~/.env.aws`. That replaces a synthesized guess with the real
-expiry, so botocore refreshes ahead of actual expiry.
+returns). It lets the shim log genuine time-to-expiry, but it does **not**
+improve pickup latency and must never widen the cap.
 
 ## Risk: bind-mounted file and inode replacement
 
@@ -127,7 +161,8 @@ must fail cleanly on a malformed read rather than emit truncated JSON.
 
 ## Tasks
 
-1. `scripts/aws-creds-shim.sh` — read mounted env file, emit v1 JSON; exit
+1. `scripts/aws-creds-shim.sh` — read mounted env file, emit v1 JSON with
+   `Expiration = min(AWS_CREDENTIAL_EXPIRATION if present, now + CAP)`; exit
    non-zero with a stderr message if any of the three credential fields is
    missing or the file is unreadable. Never echo secret values to stderr or logs.
 2. `scripts/aws-config` — single profile with `credential_process`.
@@ -159,9 +194,16 @@ Runtime evidence required; source inspection is not sufficient.
 - **V3 — no-restart pickup.** Record litellm's PID, rewrite `~/.env.aws` with
   valid fresh credentials, issue a request, confirm it succeeds **and** the PID
   is unchanged.
-- **V4 — expired-credential recovery.** Point the file at expired credentials,
-  observe the request fail, rewrite with valid ones, confirm the next request
-  succeeds with no restart and no manual intervention.
+- **V4 — recovery after a prolonged expired window.** The primary scenario, per
+  the operating model. Point the file at expired credentials, leave it expired
+  across several request attempts, confirm each fails cleanly and the proxy stays
+  up and does not restart-loop; then rewrite with valid credentials and confirm
+  the **next** request succeeds with no restart and no operator action.
+- **V4b — the cap is not widened by a real expiry.** Regression guard for the
+  defect this plan corrects. Supply `AWS_CREDENTIAL_EXPIRATION` ~12h in the
+  future, then confirm the shim still emits a capped `Expiration` and that a file
+  rewritten minutes later is picked up within the V2b bound — not held for
+  ~11h45m.
 - **V5 — malformed input.** Truncate the file mid-write; confirm the shim exits
   non-zero with a clear message and leaks no secret material.
 - **V6 — baseline.** `curl -f http://localhost:8000/health` passes and a
