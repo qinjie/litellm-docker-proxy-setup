@@ -19,10 +19,17 @@ CAP_SECONDS_MAX=600
 
 # Floor on how near the emitted Expiration may be. The emitted value schedules
 # botocore's next re-read; AWS remains the authority on whether the credentials
-# actually work. A value at or before now would have botocore treat them as
-# already expired and churn on refresh, instead of attempting the request and
-# surfacing a clean ExpiredToken per request -- which is the intended behaviour
-# while the file genuinely holds expired credentials.
+# actually work. A value at or before now instead makes botocore raise
+# RuntimeError("Credentials were refreshed, but the refreshed credentials are
+# still expired.") on every fetch -- an opaque local failure -- rather than
+# attempting the request and surfacing AWS's own ExpiredToken, which is the
+# intended behaviour while the file genuinely holds expired credentials.
+#
+# This floors the re-read schedule, not credential validity: CAP_SECONDS_MAX
+# keeps every emitted value inside the advisory window, so botocore re-invokes
+# this shim on every fetch and never treats the value as licence to keep using
+# credentials. Measured on botocore 1.43.99: one shim invocation per fetch, and
+# a rewritten file picked up by the next fetch within one long-lived session.
 CAP_SECONDS_MIN=30
 
 die() {
