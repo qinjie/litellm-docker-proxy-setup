@@ -1,0 +1,2 @@
+[profile bedrock]
+credential_process = /app/aws-creds-shim.sh
