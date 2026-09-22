@@ -121,20 +121,32 @@ window is the *expected* case, not an edge case.
 The shim therefore emits:
 
 ```
-Expiration = min(AWS_CREDENTIAL_EXPIRATION if present, now + CAP)
+Expiration = max(min(AWS_CREDENTIAL_EXPIRATION if present, now + CAP), now + FLOOR)
 ```
 
-with `CAP` short enough to sit inside the advisory window. The `min()` matters in
-both directions: the cap bounds how long a rewritten file can go unnoticed, and
-honouring a nearer real expiry avoids advertising validity the credentials do not
-have.
+Implemented in `scripts/aws-creds-shim.sh` as `CAP = 120s` and `FLOOR = 30s`,
+with the `CAP` override bounded to `[FLOOR, 600]`.
 
-Tradeoff to settle in implementation: botocore also has a 10-minute *mandatory*
-window, inside which a failed refresh raises instead of serving existing
-credentials. A `CAP` short enough to force frequent re-reads sits in or near that
-window, so a transient unreadable file surfaces as a failed request rather than
-silent staleness — the preferable failure mode here. The chosen `CAP` must be
-recorded with its reasoning, and V2b measures the bound it actually delivers.
+The `min()` bounds how long a rewritten file can go unnoticed. The `max()` is
+there because the emitted value is a **re-read schedule, not a validity claim**,
+and a past timestamp is not a usable schedule: botocore then raises
+`RuntimeError("Credentials were refreshed, but the refreshed credentials are
+still expired.")` on every fetch, converting AWS's clear per-request auth error
+into an opaque local one. Per the operating model a past real expiry is the
+expected steady state while waiting for a human, so this is the common path, not
+an edge case.
+
+The floor grants no additional reuse. Because `CAP` is bounded well below
+botocore's 900s advisory window, refresh is needed on *every* fetch by
+construction — measured on botocore 1.43.99 as one shim invocation per fetch,
+with a file rewritten mid-session picked up by the very next fetch of a reused
+credentials object. AWS remains the sole authority on whether the credentials
+actually work.
+
+The 10-minute *mandatory* window is used deliberately rather than avoided: inside
+it a failed refresh raises instead of serving existing credentials, and
+`CAP = 120s` sits inside it, so a transient unreadable file surfaces as a failed
+request rather than silent staleness. V2b measures the bound this delivers.
 
 Optional, and purely diagnostic given the cap: the host script may emit
 `AWS_CREDENTIAL_EXPIRATION` (the `Expiration` that `isengardcli` already
@@ -212,7 +224,7 @@ not shipped.
 
 1. `scripts/aws-creds-shim.sh` — read the mounted env file in a **single pass**,
    emit v1 JSON with
-   `Expiration = min(AWS_CREDENTIAL_EXPIRATION if present, now + CAP)`; exit
+   `Expiration = max(min(AWS_CREDENTIAL_EXPIRATION if present, now + CAP), now + FLOOR)`; exit
    non-zero with a stderr message if any of the three credential fields is
    missing, the file is unreadable, or (fallback shape only) the completeness
    marker is absent. Safe under concurrent invocation: no shared temp or lock
@@ -255,7 +267,10 @@ Runtime evidence required; source inspection is not sufficient.
   the operating model. Point the file at expired credentials, leave it expired
   across several request attempts, confirm each fails cleanly and the proxy stays
   up and does not restart-loop; then rewrite with valid credentials and confirm
-  the **next** request succeeds with no restart and no operator action.
+  the **next** request succeeds with no restart and no operator action. Each
+  failure must be AWS's own `ExpiredTokenException`; a local botocore
+  `RuntimeError` about refreshed-but-still-expired credentials means the floor is
+  not in effect.
 - **V4b — the cap is not widened by a real expiry.** Regression guard for the
   defect this plan corrects. Supply `AWS_CREDENTIAL_EXPIRATION` ~12h in the
   future, then confirm the shim still emits a capped `Expiration` and that a file
