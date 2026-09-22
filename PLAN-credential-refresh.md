@@ -390,10 +390,17 @@ Runtime evidence required; source inspection is not sufficient.
   which confirms detection is happening at AWS and not locally.
 - **V4b — the profile is actually in use.** Regression guard for the shadowing
   trap. Assert no `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` or
-  `AWS_SESSION_TOKEN` is present in the container environment (`docker exec env`),
-  and that credentials resolve through the shim — evidenced by the V9 counter
-  advancing at all. If the env vars survive, every other verification here passes
-  for the wrong reason.
+  `AWS_SESSION_TOKEN` is present in the container environment, and that credentials
+  resolve through the shim — evidenced by the V9 counter advancing at all. If the env
+  vars survive, every other verification here passes for the wrong reason.
+
+  Check **names only**:
+  `docker compose exec litellm sh -c 'printenv | cut -d= -f1 | sort'`. Never a bare
+  `env` or `printenv`: this assertion needs three names, but those print every value
+  in the container — the litellm master key, the database URL, and any credentials
+  that leaked in are exactly what is being looked for — into the terminal, this
+  session's transcript, and any verification notes pasted from it. Same rule
+  anywhere else the container environment is inspected.
 - **V5 — malformed input.** Truncate the file mid-write; confirm the shim exits
   non-zero with a clear message and leaks no secret material.
 - **V5b — torn read under concurrent load.** Drive concurrent requests while
