@@ -141,30 +141,60 @@ Optional, and purely diagnostic given the cap: the host script may emit
 returns). It lets the shim log genuine time-to-expiry, but it does **not**
 improve pickup latency and must never widen the cap.
 
-## Risk: bind-mounted file and inode replacement
+## Risk: how the file is written, and torn reads under concurrency
 
-`docker-compose.yml:17` bind-mounts a single **file** (`~/.env.aws`). Docker
-resolves that to an inode at container start. If the host refresh script writes
-to a temp file and `mv`s it into place, the inode changes and **the container
-keeps reading the old file indefinitely** — no amount of shim polling helps.
+Two risks share one root cause — the host script's write strategy — and they pull
+in opposite directions, so they must be settled together.
 
-If the script instead truncates and rewrites in place, the container sees
-updates. This determines whether the mount can stay as-is:
+**Inode replacement.** `docker-compose.yml:17` bind-mounts a single **file**
+(`~/.env.aws`). Docker resolves that to an inode at container start. If the host
+script writes a temp file and `mv`s it into place, the inode changes and **the
+container keeps reading the old file indefinitely** — no amount of shim polling
+helps. Mounting the enclosing *directory* instead makes replacement visible.
 
-- **in-place rewrite** → keep the file mount.
-- **atomic replace via `mv`** → mount a dedicated *directory* instead and read
-  the file from inside it, so inode replacement is visible.
+**Torn reads.** If the host script truncates and rewrites in place, a concurrent
+reader can observe a partial file. Truncated JSON is the benign case, caught by
+"fail on missing field". The dangerous case is a **torn read where all three
+fields are present but come from different generations** — a new `AccessKeyId`
+paired with an old `SecretAccessKey`. That passes a presence check and would be
+emitted as valid, producing a confusing signature failure rather than a clean
+error. This plan makes the exposure materially worse: the shim is invoked per
+request (Mechanism B), so concurrent traffic means many concurrent readers, each
+a chance to land in the rewrite window.
 
-Must be established empirically (Verification V1) before the mount is finalized.
-A partially written file is also possible under in-place rewrite, so the shim
-must fail cleanly on a malformed read rather than emit truncated JSON.
+These two combine to a single preferred shape:
+
+- **Preferred — atomic replace (`mv`) + mount the enclosing directory.** Every
+  `open()` sees a complete, self-consistent file, so torn reads are impossible by
+  construction, and directory mounting makes the new inode visible. This is the
+  only option that resolves *both* risks without depending on the shim getting
+  concurrency right.
+- **Fallback — in-place rewrite + file mount.** Keeps the current mount but
+  leaves the torn-read window open. Then the shim must additionally reject
+  inconsistent payloads rather than merely incomplete ones: read the file in a
+  single pass, and require a completeness marker written last (a trailing
+  sentinel line) so a torn read is detectable. That marker is a change to the
+  host script, which this plan does not own — so this path needs the script
+  owner's agreement.
+
+Settle empirically via V1 before finalizing the mount. If the script currently
+rewrites in place, the smaller and safer change is to switch it to
+write-temp-then-`mv` rather than to add sentinel handling to the shim.
+
+The shim must also be safe under concurrent invocation in its own right: no
+shared temp files, no lock files that can deadlock or leave stale locks. The V2
+counter file is verification instrumentation only and must be removed afterwards,
+not shipped.
 
 ## Tasks
 
-1. `scripts/aws-creds-shim.sh` — read mounted env file, emit v1 JSON with
+1. `scripts/aws-creds-shim.sh` — read the mounted env file in a **single pass**,
+   emit v1 JSON with
    `Expiration = min(AWS_CREDENTIAL_EXPIRATION if present, now + CAP)`; exit
    non-zero with a stderr message if any of the three credential fields is
-   missing or the file is unreadable. Never echo secret values to stderr or logs.
+   missing, the file is unreadable, or (fallback shape only) the completeness
+   marker is absent. Safe under concurrent invocation: no shared temp or lock
+   files. Never echo secret values to stderr or logs.
 2. `scripts/aws-config` — single profile with `credential_process`.
 3. `docker-compose.yml` — mount shim and config, set `AWS_CONFIG_FILE`, settle
    the mount shape per V1, and stop supplying AWS credentials via `env_file`.
@@ -206,10 +236,19 @@ Runtime evidence required; source inspection is not sufficient.
   ~11h45m.
 - **V5 — malformed input.** Truncate the file mid-write; confirm the shim exits
   non-zero with a clear message and leaks no secret material.
+- **V5b — torn read under concurrent load.** Drive concurrent requests while
+  rewriting the file in a loop, and assert no request ever authenticates with a
+  mismatched key pair: every request either succeeds with a consistent
+  generation or fails cleanly. Under the preferred atomic-replace shape this
+  should hold by construction; run it anyway, since it is the guard that proves
+  the chosen shape actually delivers that.
 - **V6 — baseline.** `curl -f http://localhost:8000/health` passes and a
   completion against `claude-sonnet-4-5` succeeds.
 
 ## Open question
 
-Blocks V1 and task 3: the path of the existing host refresh script, so its write
-strategy can be read rather than guessed.
+Blocks V1, V5b and task 3: the path of the existing host refresh script, so its
+write strategy can be read rather than guessed. It determines the mount shape,
+whether torn reads are possible at all, and whether the shim needs completeness
+checking — and if the script rewrites in place, whether its owner will switch it
+to write-temp-then-`mv`.
