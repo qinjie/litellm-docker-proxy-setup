@@ -193,16 +193,36 @@ Two risks share one root cause — the host script's write strategy — and they
 in opposite directions, so they must be settled together.
 
 **Inode replacement.** `docker-compose.yml:17` bind-mounts a single **file**
-(`~/.env.aws`). Docker resolves that to an inode at container start. If the host
-script writes a temp file and `mv`s it into place — or deletes and recreates the
-file — the inode changes and **the container keeps reading the old file
-indefinitely**, no matter how often the shim re-reads. Mounting the *directory*
-that contains the file makes replacement visible.
+(`~/.env.aws`). Docker resolves that to an inode at container start, so replacing
+the file on the host — `mv` into place, or delete and recreate — detaches the mount
+from the live file. Not hypothetical: shell history contains `rm ~/.env.aws`.
 
-This is not hypothetical: shell history contains `rm ~/.env.aws`, so the file has
-been deleted and recreated at least once. That alone does not prove the current
-refresh procedure replaces the inode every time, which is why V1 stays open, but it
-does mean the single-file mount cannot be assumed safe.
+Measured on this host (Rancher Desktop, Alpine VM, 2026-09-22) rather than assumed,
+and the result is better than feared — the container does **not** go on serving the
+old contents:
+
+| host action | what the container sees |
+| --- | --- |
+| in-place rewrite (truncate) | new contents, same inode — works |
+| `mv` replacement | `cat`: **No such file or directory** |
+| `rm` + recreate | `cat`: **No such file or directory** |
+| `docker restart` after either | new contents, new inode — recovered |
+
+So replacement fails **loudly and recoverably**, not silently, and the shim already
+handles it: `cat` fails and it dies with `failed to read <path>`. Note that
+`[ -r "$ENV_FILE" ]` returns *true* on a detached mount — the readability precheck
+is not what catches this, the `cat` failure is, and the precheck must not be
+trusted to.
+
+That error reaches the operator rather than being buried: botocore carries a failing
+credential process's stderr verbatim into `CredentialRetrievalError` (measured:
+`Error when retrieving credentials from custom-process: aws-creds-shim: ...`), and
+litellm builds a fresh session each cache TTL, so within ~600s of a replacement a
+request fails with the shim's own message.
+
+Caveat on the measurement: that is the Mac file-sharing path. On native-Linux Docker
+the classic pinned-inode semantics may apply instead, and replacement there *would*
+be silently stale. Re-run V1 before running this setup on Linux.
 
 **Torn reads.** If the host script truncates and rewrites in place, a concurrent
 reader can observe a partial file. Truncated JSON is the benign case, caught by
@@ -257,12 +277,16 @@ directory: it makes torn reads structurally impossible instead of detectable
 after the fact.
 
 **Decision, so tasks 3-5 are not blocked:** land the switchover on the **existing
-single-file mount**, unchanged. That is already what the repo does
-(`docker-compose.yml:17`), so it introduces no regression — today's checksum poller
-reads the very same mounted path and is defeated by inode replacement in exactly
-the same way. The dedicated directory becomes a follow-up, taken if V1 shows the
-writer replaces the inode, and it needs the writer's owner to accept a new path.
-Either way the README carries the caveat.
+single-file mount**, unchanged. Two reasons, in order of weight. First the
+measurement above: replacement surfaces as a clear per-request error naming its own
+fix, not as indefinite silent staleness, and `docker compose up -d` recovers it.
+Second, it is already what the repo does (`docker-compose.yml:17`), so nothing
+regresses — today's checksum poller reads the same mounted path.
+
+What this does **not** do is make replacement transparent: a person still has to
+recreate the container once. The dedicated directory stays the only shape needing no
+intervention, so it remains the preferred follow-up, gated on V1 and on the writer's
+owner accepting a new path.
 
 The shim must also be safe under concurrent invocation in its own right: no
 shared temp files, no lock files that can deadlock or leave stale locks. The V9
@@ -274,8 +298,12 @@ not shipped.
 1. `scripts/aws-creds-shim.sh` — read the mounted env file in a **single pass**,
    emit v1 JSON with `Expiration = now + ADVISORY_WINDOW + REREAD_DELAY`; exit
    non-zero with a stderr message if any of the three credential fields is
-   missing or the file is unreadable. Safe under concurrent invocation: no shared
-   temp or lock files. Never echo secret values to stderr or logs. The
+   missing or the file is unreadable. Because that stderr is what the operator
+   actually sees (it arrives verbatim in `CredentialRetrievalError`), the read
+   failure message must name the likely cause and the fix: the mount was detached
+   by a host-side replacement, recover with `docker compose up -d`. Safe under
+   concurrent invocation: no shared temp or lock files. Never echo secret values to
+   stderr or logs. The
    `REREAD_DELAY` override must be validated and bounded — an override able to
    exceed `[1, 600]` would make the staleness bound the delay exists to define
    arbitrarily large. **Already implemented against the superseded cap-and-floor
@@ -295,17 +323,23 @@ not shipped.
    exported variables would otherwise shadow the profile.
 6. `README.md` — document the mechanism, quote the V9 measured re-read interval
    and name `REREAD_DELAY` as the worst-case pickup lag, state the
-   `ADVISORY_WINDOW = 900s` botocore assumption from V8, record the inode caveat
-   on the single-file mount, and state the constraint that adding an `aws_*`
-   credential param to a model silently reverts to per-request re-reads.
+   `ADVISORY_WINDOW = 900s` botocore assumption from V8, and state the constraint
+   that adding an `aws_*` credential param to a model silently reverts to
+   per-request re-reads. Document the single-file mount caveat as a **procedure**,
+   not just a warning: if the credentials file is replaced rather than rewritten in
+   place, requests fail with `CredentialRetrievalError` naming the shim, and
+   `docker compose up -d` is the recovery.
 
 ## Verification
 
 Runtime evidence required; source inspection is not sufficient.
 
-- **V1 — inode behaviour.** Identify how the host script writes `~/.env.aws`
-  (in-place vs `mv`). With the container up, rewrite the file and `docker exec`
-  a read to confirm the container observes new content. Settles task 3.
+- **V1 — inode behaviour.** Partly answered above, measured on Rancher Desktop: an
+  in-place rewrite is visible to the container, and a replacement makes the mounted
+  path unreadable until the container is recreated. What remains is which of the two
+  the host refresh script does, and a re-run on native Linux if this ever moves
+  there. Repeat against the real litellm container once it is up, and confirm the
+  detached-mount failure surfaces as a request error carrying the shim's message.
 - **V9 — the delay is real: re-reads are not per request.** The central check for
   this requirement. Have the shim append a timestamp to a counter file, issue N
   requests well inside one `REREAD_DELAY`, and confirm the invocation count is ~1,
