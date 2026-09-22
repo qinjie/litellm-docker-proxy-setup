@@ -30,11 +30,17 @@ so it cannot be run on a timer. Two consequences shape the design:
   file is rewritten must succeed, with no restart and no operator action beyond
   the refresh itself.** Latency is measured from the file changing, not from
   expiry.
-
 - Re-reading the file on every request during that window is pure churn — nothing
   the container can do makes expired credentials work, and only a person can
   change that. So the file is re-read on a **delay**, at most once per
   `REREAD_DELAY`, not once per failed request.
+
+One precondition on the no-operator-action property, stated here because it
+constrains the whole design: it holds when the file is rewritten **in place**. A
+writer that *replaces* the file detaches the bind mount, and no container-side work
+can recover from that — it takes either one manual restart or a different mount
+shape. Which of the two the host script does is the open question below, and it
+gates calling this work done.
 
 The proxy must also not degrade during the expired window: it should keep
 failing cleanly per request and remain ready, rather than restart-looping or
@@ -277,19 +283,30 @@ Both paths need the script owner to change something, so the choice is not
 directory: it makes torn reads structurally impossible instead of detectable
 after the fact.
 
-**Decision, so tasks 3-5 are not blocked:** land the switchover on the **existing
-single-file mount**, unchanged. Two reasons, in order of weight. First the
-measurement above: replacement surfaces as a clear per-request error naming its own
-fix, not as indefinite silent staleness, and `docker compose restart` recovers it.
-It must be `restart`: `up -d` on an unchanged config and image is a no-op — measured,
-it reports `Running` and leaves the mount detached.
-Second, it is already what the repo does (`docker-compose.yml:17`), so nothing
-regresses — today's checksum poller reads the same mounted path.
+**Decision, so tasks 3-5 are not blocked:** build tasks 3-5 on the **existing
+single-file mount**, unchanged — it is already what the repo does
+(`docker-compose.yml:17`), so nothing regresses, and replacement surfaces as a clear
+per-request error naming its own fix rather than as indefinite silent staleness.
+Recovery is `docker compose restart`, not `up -d`: on an unchanged config and image
+`up -d` is a no-op — measured, it reports `Running` and leaves the mount detached.
 
-What this does **not** do is make replacement transparent: a person still has to
-recreate the container once. The dedicated directory stays the only shape needing no
-intervention, so it remains the preferred follow-up, gated on V1 and on the writer's
-owner accepting a new path.
+That is a decision about **which mount to build against, not about what ships**. A
+mount needing a manual restart after every refresh does not satisfy the operating
+model above, so it cannot be the final answer if the writer replaces the inode.
+Hence **V1 is a release gate, not a curiosity**:
+
+- **Writer rewrites in place** → the single-file mount already meets the operating
+  model in full, and no further mount work is needed.
+- **Writer replaces the inode** (`mv`, delete-and-recreate, or most editors) → the
+  single-file mount can only ever meet it with an operator restart, so the
+  **dedicated directory becomes required** before this work is called done. It moves
+  from "preferred follow-up" to a blocking task, and the plan is not complete until
+  it lands.
+
+So the dedicated directory is deferred only in *sequence*, never in *scope*: V1
+decides whether it is unnecessary or mandatory, and until V1 runs, this plan is
+provisional on the answer. What it is **not** is optional — nothing here approves a
+setup that needs a restart on every refresh.
 
 The shim must also be safe under concurrent invocation in its own right: no
 shared temp files, no lock files that can deadlock or leave stale locks. The V9
@@ -332,18 +349,24 @@ not shipped.
    not just a warning: if the credentials file is replaced rather than rewritten in
    place, requests fail with `CredentialRetrievalError` naming the shim, and
    `docker compose restart` is the recovery — and say why `up -d` is not, since
-   that is the command an operator will reach for first.
+   that is the command an operator will reach for first. If V1 shows the writer
+   replaces the inode, that procedure is not the answer and the dedicated directory
+   lands first (mount decision above); the README then documents the new path
+   instead of a restart ritual.
 
 ## Verification
 
 Runtime evidence required; source inspection is not sufficient.
 
-- **V1 — inode behaviour.** Partly answered above, measured on Rancher Desktop: an
-  in-place rewrite is visible to the container, and a replacement makes the mounted
-  path unreadable until the container is recreated. What remains is which of the two
-  the host refresh script does, and a re-run on native Linux if this ever moves
-  there. Repeat against the real litellm container once it is up, and confirm the
-  detached-mount failure surfaces as a request error carrying the shim's message.
+- **V1 — inode behaviour. Release gate.** Partly answered above, measured on Rancher
+  Desktop: an in-place rewrite is visible to the container, and a replacement makes
+  the mounted path unreadable until the container is recreated. What remains is which
+  of the two the host refresh script does, and a re-run on native Linux if this ever
+  moves there. Repeat against the real litellm container once it is up, and confirm
+  the detached-mount failure surfaces as a request error carrying the shim's message.
+  A "replaces" result makes the dedicated directory a required task, per the mount
+  decision above; this verification therefore cannot be skipped or deferred past
+  completion.
 - **V9 — the delay is real: re-reads are not per request.** The central check for
   this requirement. Have the shim append a timestamp to a counter file, issue N
   requests well inside one `REREAD_DELAY`, and confirm the invocation count is ~1,
@@ -388,11 +411,17 @@ Runtime evidence required; source inspection is not sufficient.
 
 ## Open question
 
-No longer blocks tasks 3-5 — the mount shape decision above lets the switchover
-land on the existing single-file mount. It still blocks V1 and any move to a
-dedicated directory: the write strategy of the host refresh script. Searching the
-machine did not find it (`~/bin`, `~/.local/bin`, shell config, and history all
-show only reads of `~/.env.aws`, plus one `rm`), so it cannot be read rather than
-guessed. What is needed is whether it rewrites in place or replaces the inode
-(`mv`, or delete-and-recreate); only the first is safe on a single-file bind mount.
-Note that hand-editing the file in most editors also replaces the inode.
+**The write strategy of the host refresh script** — in-place rewrite, or inode
+replacement (`mv`, delete-and-recreate)? Only the first is safe on a single-file bind
+mount. Note that hand-editing the file in most editors also replaces the inode.
+
+This does not block tasks 3-5, which build against the existing mount either way. It
+does gate **completion**: it is the input to V1, and per the mount decision a
+"replaces" answer makes the dedicated directory a required task rather than a
+follow-up. So the plan cannot be signed off without it.
+
+Searching the machine did not find the script (`~/bin`, `~/.local/bin`, shell config,
+and history all show only reads of `~/.env.aws`, plus one `rm`), so it cannot be read
+rather than guessed — its owner has to answer. Failing that, V1 can be settled
+empirically: refresh once for real, then check whether the mounted path inside the
+container is still readable.
