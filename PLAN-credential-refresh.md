@@ -2,10 +2,15 @@
 
 **Status:** proposed
 **Date:** 2026-09-22
-**Scope:** make the running proxy observe a rewritten `~/.env.aws` promptly and
-**without a process restart**, instead of up to 300s later plus a restart. The
-guaranteed bound is set by the `Expiration` refresh schedule (Mechanism A); the
-common case is faster (Mechanism B), but that is not promised.
+**Revised:** 2026-09-22 — re-reads are now delayed rather than per-request, at the
+owner's direction. This reversed two earlier choices: `aws_profile_name` gave way
+to `AWS_PROFILE`, and the short-capped `Expiration` gave way to one placed beyond
+botocore's advisory window. Tasks 1 and 4 changed as a result.
+**Scope:** make the running proxy observe a rewritten `~/.env.aws` **without a
+process restart**, instead of up to 300s later plus a restart. Re-reads happen on
+a bounded delay rather than per request: `REREAD_DELAY` is both the interval
+between re-reads and the worst-case lag between a person rewriting the file and
+the proxy using it.
 
 ## Out of scope
 
@@ -26,9 +31,17 @@ so it cannot be run on a timer. Two consequences shape the design:
   the refresh itself.** Latency is measured from the file changing, not from
   expiry.
 
+- Re-reading the file on every request during that window is pure churn — nothing
+  the container can do makes expired credentials work, and only a person can
+  change that. So the file is re-read on a **delay**, at most once per
+  `REREAD_DELAY`, not once per failed request.
+
 The proxy must also not degrade during the expired window: it should keep
 failing cleanly per request and remain ready, rather than restart-looping or
 wedging itself.
+
+Credential *acquisition* is entirely outside the container. Nothing here runs,
+wraps, or depends on `isengardcli`.
 
 ## Findings in the current design
 
@@ -73,85 +86,106 @@ Stop feeding credentials through the environment. Use botocore's
 - **AWS config** (`scripts/aws-config`, mounted) defines one profile whose
   `credential_process` is that shim. `AWS_CONFIG_FILE` points at it, so this
   works regardless of which user the image runs as.
-- **`litellm_config.yaml`** sets `aws_profile_name` on each Bedrock model.
+- **`docker-compose.yml`** sets `AWS_PROFILE` and `AWS_CONFIG_FILE`, and stops
+  supplying AWS credentials as environment variables. Both matter: botocore's
+  environment provider outranks the profile, so a leftover `AWS_ACCESS_KEY_ID`
+  in the container env silently wins and the shim is never consulted.
+- **`litellm_config.yaml`** is left unchanged — see below; the absence of
+  `aws_*` credential params is what selects the right code path.
 - **`entrypoint.sh`** collapses to `exec litellm ...`; the FIFO, flag file,
   cooldown, and checksum loop are deleted.
 
-### Two independent reasons pickup is fast
+### Why `AWS_PROFILE`, and not `aws_profile_name`
 
-**Mechanism A — botocore refresh (load-bearing).** `ProcessProvider` returns
-`RefreshableCredentials` when the payload carries `Expiration`, and re-invokes
-the shim once the remaining lifetime falls inside botocore's advisory refresh
-window (15 minutes). The shim will therefore always emit an `Expiration` set a
-short interval ahead — inside that window — so refresh is attempted on
-effectively every credential fetch, *within a single long-lived session*. This
-holds no matter how litellm caches.
+A delay between re-reads can only exist if the credentials object *survives*
+between requests. That rules out the obvious wiring.
 
-**Mechanism B — litellm re-resolving per call (observed, not contracted).**
-On `main`, `base_aws_llm.py:482-484` dispatches the `aws_profile_name` branch to
-`_auth_with_aws_profile` and returns directly, **not** through
-`_get_or_set_cached_credentials` as the other four auth branches do; and
-`base_aws_llm.py:1393-1402` builds a fresh `boto3.Session(profile_name=...)` per
-call. So the profile is re-resolved from disk each request.
+**Rejected — `aws_profile_name` per model.** `base_aws_llm.py:482-484` dispatches
+that branch to `_auth_with_aws_profile` and returns directly, bypassing
+`_get_or_set_cached_credentials`; `:1393-1402` then builds a fresh
+`boto3.Session(profile_name=...)` per call. This is deliberate, and stated in the
+source: *"Profiles and explicit session-token tuples are not cached here — shared
+`Credentials` / refresh state must not span logical sessions"*
+(`base_aws_llm.py:301-302`). Every request would therefore construct a new
+provider and run the shim, re-reading the file per request. Correct, but the
+opposite of the requirement.
 
-Mechanism B is the faster of the two, but it is **internal behaviour, not a
-documented contract**, and `docker-compose.yml:3` pins `main-latest` — a moving
-tag. A future image could reintroduce caching on this path and silently
-regress it. The design must remain correct on Mechanism A alone; B is an
-optimisation, and the plan does not promise next-request pickup on its basis.
+**Chosen — ambient credentials via `AWS_PROFILE`.** With no `aws_*` credential
+params set, `get_credentials` falls to its final branch,
+`_get_or_set_cached_credentials(args, self._auth_with_env_vars)`
+(`base_aws_llm.py:510`), and `_auth_with_env_vars` (`:1451-1460`) is just
+`boto3.Session()` → `session.get_credentials()`. A plain session honours
+`AWS_PROFILE` and `AWS_CONFIG_FILE`, so it resolves our profile and its
+`credential_process` — and the resulting `RefreshableCredentials` object is
+**cached** (ttl `None` → `InMemoryCache` `default_ttl`, 600s per
+`base_aws_llm.py:291-293`). It therefore persists across requests, and botocore's
+own refresh schedule decides when the shim runs again.
 
-### `Expiration` must be emitted, and must be capped short
+This is what makes `litellm_config.yaml` a no-op: the six Bedrock entries set only
+`aws_region_name`, which selects no auth branch. Adding any credential param to a
+model would divert it to a different branch and quietly reintroduce per-request
+re-reads. That is a constraint to state in the README, not just here.
+
+**Failure direction is safe.** litellm's caching is internal behaviour and
+`docker-compose.yml:3` pins `main-latest`, a moving tag. But note which way a
+regression cuts: if a future image stopped caching this branch, the shim would be
+invoked more often, not less — the delay would degrade toward per-request reads
+while pickup stays correct and gets *faster*. Nothing about correctness rests on
+the cache. A longer TTL is equally harmless, because the cached object is
+refreshable and botocore's schedule still governs re-reads.
+
+### `Expiration` is the re-read schedule
 
 `~/.env.aws` contains only `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
-`AWS_SESSION_TOKEN`, `AWS_DEFAULT_REGION`. botocore's `ProcessProvider` treats a
-payload **without** `Expiration` as static, non-refreshable credentials — which
-disables Mechanism A entirely and leaves freshness resting on the un-contracted
-Mechanism B. So the shim must always emit one.
+`AWS_SESSION_TOKEN`, `AWS_DEFAULT_REGION` — inspected 2026-09-22, and there is **no
+expiry field**. So the shim cannot derive an expiry; it must synthesise one.
+Omitting it is not an option either: botocore's `ProcessProvider` treats a payload
+without `Expiration` as static, non-refreshable credentials, which means it never
+re-invokes the shim at all and the file is read exactly once per process.
 
-**It must also always cap it.** The emitted value governs *when botocore next
-re-reads the file*, and is not a safety property — emitting an expiry earlier
-than the credential's true expiry only makes botocore re-read more often, which
-is precisely what is wanted. Emitting the real expiry is actively harmful here:
-these credentials carry a ~12h lifetime, far outside botocore's 15-minute
-advisory window, so botocore would not re-invoke the shim for roughly 11h45m. A
-file rewritten by hand inside that window would be missed for hours — defeating
-the entire purpose. Given the operating model above, a hand-edit landing in that
-window is the *expected* case, not an edge case.
+The emitted value is therefore a **re-read schedule, not a validity claim.** AWS is
+the sole authority on whether the credentials work; the only thing this timestamp
+decides is when botocore next runs the shim.
 
-The shim therefore emits:
+Because botocore re-invokes the shim once remaining lifetime drops inside its
+advisory refresh window, the interval between re-reads is set by placing
+`Expiration` that far *beyond* the window:
 
 ```
-Expiration = max(min(AWS_CREDENTIAL_EXPIRATION if present, now + CAP), now + FLOOR)
+Expiration = now + ADVISORY_WINDOW + REREAD_DELAY
 ```
 
-Implemented in `scripts/aws-creds-shim.sh` as `CAP = 120s` and `FLOOR = 30s`,
-with the `CAP` override bounded to `[FLOOR, 600]`.
+`REREAD_DELAY` is then exactly the re-read interval, and hence the worst-case lag
+between a person rewriting the file and the proxy using it. Implemented as
+`REREAD_DELAY = 60s`, overridable and bounded to `[1, 600]`.
 
-The `min()` bounds how long a rewritten file can go unnoticed. The `max()` is
-there because the emitted value is a **re-read schedule, not a validity claim**,
-and a past timestamp is not a usable schedule: botocore then raises
-`RuntimeError("Credentials were refreshed, but the refreshed credentials are
-still expired.")` on every fetch, converting AWS's clear per-request auth error
-into an opaque local one. Per the operating model a past real expiry is the
-expected steady state while waiting for a human, so this is the common path, not
-an edge case.
+No expiry comparison and no floor: there is nothing in the file to compare
+against, and a timestamp this far ahead is never in the past. The earlier
+cap-and-floor formulation existed to force a re-read on *every* fetch — precisely
+the behaviour this requirement replaces — so it is removed rather than tuned.
 
-The floor grants no additional reuse. Because `CAP` is bounded well below
-botocore's 900s advisory window, refresh is needed on *every* fetch by
-construction — measured on botocore 1.43.99 as one shim invocation per fetch,
-with a file rewritten mid-session picked up by the very next fetch of a reused
-credentials object. AWS remains the sole authority on whether the credentials
-actually work.
+Consequences, stated plainly:
 
-The 10-minute *mandatory* window is used deliberately rather than avoided: inside
-it a failed refresh raises instead of serving existing credentials, and
-`CAP = 120s` sits inside it, so a transient unreadable file surfaces as a failed
-request rather than silent staleness. V2b measures the bound this delivers.
+- During an expired window every request fails at AWS with
+  `ExpiredTokenException`. That *is* the expiry detection; the container has no
+  local means of detecting it, and does not need one.
+- A refreshed file is picked up within `REREAD_DELAY`, with no restart.
+- Re-read cost drops from one subprocess per request to one per `REREAD_DELAY`.
+- Refresh now lands in botocore's *advisory* window rather than its 10-minute
+  *mandatory* one, so an unreadable file no longer fails the request: botocore
+  logs a warning and keeps serving what it holds. Acceptable exactly because the
+  timestamp was never a validity claim — if those credentials are good the request
+  succeeds, and if they are expired AWS rejects it. This reverses an earlier
+  preference for the mandatory window, which assumed per-fetch re-reads.
 
-Optional, and purely diagnostic given the cap: the host script may emit
-`AWS_CREDENTIAL_EXPIRATION` (the `Expiration` that `isengardcli` already
-returns). It lets the shim log genuine time-to-expiry, but it does **not**
-improve pickup latency and must never widen the cap.
+### Risk: `ADVISORY_WINDOW` is a botocore constant, not a contract
+
+The formula hardcodes botocore's 15-minute advisory window
+(`_advisory_refresh_timeout`). It has been 900s for years, but the image pins
+`main-latest`, so its botocore can move. If that window ever **shrinks**, re-reads
+happen later than `REREAD_DELAY` promises, silently — e.g. a 600s window with
+`REREAD_DELAY = 60s` would re-read every 360s. V8 asserts the constant in the
+running image, and the README must name the assumption.
 
 ## Risk: how the file is written, and torn reads under concurrency
 
@@ -160,9 +194,15 @@ in opposite directions, so they must be settled together.
 
 **Inode replacement.** `docker-compose.yml:17` bind-mounts a single **file**
 (`~/.env.aws`). Docker resolves that to an inode at container start. If the host
-script writes a temp file and `mv`s it into place, the inode changes and **the
-container keeps reading the old file indefinitely** — no amount of shim polling
-helps. Mounting the *directory* that contains the file makes replacement visible.
+script writes a temp file and `mv`s it into place — or deletes and recreates the
+file — the inode changes and **the container keeps reading the old file
+indefinitely**, no matter how often the shim re-reads. Mounting the *directory*
+that contains the file makes replacement visible.
+
+This is not hypothetical: shell history contains `rm ~/.env.aws`, so the file has
+been deleted and recreated at least once. That alone does not prove the current
+refresh procedure replaces the inode every time, which is why V1 stays open, but it
+does mean the single-file mount cannot be assumed safe.
 
 **Torn reads.** If the host script truncates and rewrites in place, a concurrent
 reader can observe a partial file. Truncated JSON is the benign case, caught by
@@ -170,9 +210,10 @@ reader can observe a partial file. Truncated JSON is the benign case, caught by
 fields are present but come from different generations** — a new `AccessKeyId`
 paired with an old `SecretAccessKey`. That passes a presence check and would be
 emitted as valid, producing a confusing signature failure rather than a clean
-error. This plan makes the exposure materially worse: the shim is invoked per
-request (Mechanism B), so concurrent traffic means many concurrent readers, each
-a chance to land in the rewrite window.
+error. The delayed-re-read design shrinks this exposure considerably compared with
+per-request reads: there is at most one reader per `REREAD_DELAY` per cache entry,
+so the odds of landing inside a rewrite window are small. Small is not zero, and
+the window is still only closed by an atomic replace on the writing side.
 
 ### Hard constraint: `$HOME` must never be mounted
 
@@ -213,35 +254,50 @@ So directory mounting is only available if the credentials live in a
 Both paths need the script owner to change something, so the choice is not
 "cheap vs expensive" — it is which guarantee is wanted. Prefer the dedicated
 directory: it makes torn reads structurally impossible instead of detectable
-after the fact. Settle empirically via V1 before finalizing.
+after the fact.
+
+**Decision, so tasks 3-5 are not blocked:** land the switchover on the **existing
+single-file mount**, unchanged. That is already what the repo does
+(`docker-compose.yml:17`), so it introduces no regression — today's checksum poller
+reads the very same mounted path and is defeated by inode replacement in exactly
+the same way. The dedicated directory becomes a follow-up, taken if V1 shows the
+writer replaces the inode, and it needs the writer's owner to accept a new path.
+Either way the README carries the caveat.
 
 The shim must also be safe under concurrent invocation in its own right: no
-shared temp files, no lock files that can deadlock or leave stale locks. The V2
+shared temp files, no lock files that can deadlock or leave stale locks. The V9
 counter file is verification instrumentation only and must be removed afterwards,
 not shipped.
 
 ## Tasks
 
 1. `scripts/aws-creds-shim.sh` — read the mounted env file in a **single pass**,
-   emit v1 JSON with
-   `Expiration = max(min(AWS_CREDENTIAL_EXPIRATION if present, now + CAP), now + FLOOR)`; exit
+   emit v1 JSON with `Expiration = now + ADVISORY_WINDOW + REREAD_DELAY`; exit
    non-zero with a stderr message if any of the three credential fields is
-   missing, the file is unreadable, or (fallback shape only) the completeness
-   marker is absent. Safe under concurrent invocation: no shared temp or lock
-   files. Never echo secret values to stderr or logs. If `CAP` is overridable,
-   the override must be validated and bounded — an override able to exceed the
-   refresh windows would silently reintroduce the unbounded staleness the cap
-   exists to prevent.
-2. `scripts/aws-config` — single profile with `credential_process`.
-3. `docker-compose.yml` — mount shim and config, set `AWS_CONFIG_FILE`, settle
-   the mount shape per V1, and stop supplying AWS credentials via `env_file`.
-   The mount must name either the single credentials file or a dedicated
-   directory; mounting `$HOME` (or any parent of it) is prohibited.
-4. `litellm_config.yaml` — add `aws_profile_name` to the six Bedrock entries.
-5. `entrypoint.sh` — reduce to `exec litellm`.
-6. `README.md` — document the mechanism, quote the V2b guaranteed staleness
-   bound rather than the faster V2 combined figure, and describe the
-   `AWS_CREDENTIAL_EXPIRATION` line the host script should emit.
+   missing or the file is unreadable. Safe under concurrent invocation: no shared
+   temp or lock files. Never echo secret values to stderr or logs. The
+   `REREAD_DELAY` override must be validated and bounded — an override able to
+   exceed `[1, 600]` would make the staleness bound the delay exists to define
+   arbitrarily large. **Already implemented against the superseded cap-and-floor
+   contract; this task is now a revision of an existing file, not new work.**
+2. `scripts/aws-config` — single profile with `credential_process`. Done.
+3. `docker-compose.yml` — mount shim and config, set `AWS_CONFIG_FILE` **and
+   `AWS_PROFILE`**, keep the existing single-file credentials mount, and stop
+   supplying AWS credentials via `env_file`. No `AWS_ACCESS_KEY_ID`,
+   `AWS_SECRET_ACCESS_KEY` or `AWS_SESSION_TOKEN` may remain in the container
+   environment: botocore's env provider outranks the profile and would shadow the
+   shim entirely. Mounting `$HOME` (or any parent of it) is prohibited.
+4. `litellm_config.yaml` — **no change.** Verify only that no entry sets an
+   `aws_*` credential param, since that is what keeps every model on the cached
+   ambient-credentials branch.
+5. `entrypoint.sh` — reduce to `exec litellm`. This also removes the startup
+   `source` of the credentials file, which is required, not incidental: those
+   exported variables would otherwise shadow the profile.
+6. `README.md` — document the mechanism, quote the V9 measured re-read interval
+   and name `REREAD_DELAY` as the worst-case pickup lag, state the
+   `ADVISORY_WINDOW = 900s` botocore assumption from V8, record the inode caveat
+   on the single-file mount, and state the constraint that adding an `aws_*`
+   credential param to a model silently reverts to per-request re-reads.
 
 ## Verification
 
@@ -250,16 +306,17 @@ Runtime evidence required; source inspection is not sufficient.
 - **V1 — inode behaviour.** Identify how the host script writes `~/.env.aws`
   (in-place vs `mv`). With the container up, rewrite the file and `docker exec`
   a read to confirm the container observes new content. Settles task 3.
-- **V2 — shim re-invocation, and which mechanism supplies it.** Have the shim
-  append a timestamp to a counter file, then issue N requests and record how
-  many invocations result. This measures the *combined* effect of Mechanisms A
-  and B; it does not by itself distinguish them. Record the observed ratio and
-  the image digest it was measured against, since Mechanism B is not contracted.
-- **V2b — staleness bound without Mechanism B.** Establish the worst case if
-  litellm reintroduces caching on the profile path: hold one session open and
-  confirm the shim is still re-invoked on the `Expiration`-driven schedule
-  alone. This is the number the design actually guarantees, and it is what the
-  README should quote — not V2's faster combined figure.
+- **V9 — the delay is real: re-reads are not per request.** The central check for
+  this requirement. Have the shim append a timestamp to a counter file, issue N
+  requests well inside one `REREAD_DELAY`, and confirm the invocation count is ~1,
+  not N. Then run for several delay periods and confirm the interval between
+  invocations is `REREAD_DELAY`, not shorter. Record the image digest, since the
+  cache this relies on is internal litellm behaviour.
+- **V8 — the botocore advisory window really is 900s.** `docker exec` a read of
+  `botocore.credentials.RefreshableCredentials._advisory_refresh_timeout` in the
+  running image. If it is not 900, the emitted `Expiration` must be recomputed from
+  the real value, because `REREAD_DELAY` silently stops being the interval.
+  Record the botocore version alongside it.
 - **V3 — no-restart pickup.** Record litellm's PID, rewrite `~/.env.aws` with
   valid fresh credentials, issue a request, confirm it succeeds **and** the PID
   is unchanged.
@@ -267,15 +324,15 @@ Runtime evidence required; source inspection is not sufficient.
   the operating model. Point the file at expired credentials, leave it expired
   across several request attempts, confirm each fails cleanly and the proxy stays
   up and does not restart-loop; then rewrite with valid credentials and confirm
-  the **next** request succeeds with no restart and no operator action. Each
-  failure must be AWS's own `ExpiredTokenException`; a local botocore
-  `RuntimeError` about refreshed-but-still-expired credentials means the floor is
-  not in effect.
-- **V4b — the cap is not widened by a real expiry.** Regression guard for the
-  defect this plan corrects. Supply `AWS_CREDENTIAL_EXPIRATION` ~12h in the
-  future, then confirm the shim still emits a capped `Expiration` and that a file
-  rewritten minutes later is picked up within the V2b bound — not held for
-  ~11h45m.
+  the **next** request issued after one `REREAD_DELAY` succeeds, with no restart
+  and no operator action. Each failure must be AWS's own `ExpiredTokenException`,
+  which confirms detection is happening at AWS and not locally.
+- **V4b — the profile is actually in use.** Regression guard for the shadowing
+  trap. Assert no `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` or
+  `AWS_SESSION_TOKEN` is present in the container environment (`docker exec env`),
+  and that credentials resolve through the shim — evidenced by the V9 counter
+  advancing at all. If the env vars survive, every other verification here passes
+  for the wrong reason.
 - **V5 — malformed input.** Truncate the file mid-write; confirm the shim exits
   non-zero with a clear message and leaks no secret material.
 - **V5b — torn read under concurrent load.** Drive concurrent requests while
@@ -293,8 +350,11 @@ Runtime evidence required; source inspection is not sufficient.
 
 ## Open question
 
-Blocks V1, V5b and task 3: the path of the existing host refresh script, so its
-write strategy can be read rather than guessed. It determines the mount shape,
-whether torn reads are possible at all, and whether the shim needs completeness
-checking — and if the script rewrites in place, whether its owner will switch it
-to write-temp-then-`mv`.
+No longer blocks tasks 3-5 — the mount shape decision above lets the switchover
+land on the existing single-file mount. It still blocks V1 and any move to a
+dedicated directory: the write strategy of the host refresh script. Searching the
+machine did not find it (`~/bin`, `~/.local/bin`, shell config, and history all
+show only reads of `~/.env.aws`, plus one `rm`), so it cannot be read rather than
+guessed. What is needed is whether it rewrites in place or replaces the inode
+(`mv`, or delete-and-recreate); only the first is safe on a single-file bind mount.
+Note that hand-editing the file in most editors also replaces the inode.
