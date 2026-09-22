@@ -6,11 +6,21 @@
 owner's direction. This reversed two earlier choices: `aws_profile_name` gave way
 to `AWS_PROFILE`, and the short-capped `Expiration` gave way to one placed beyond
 botocore's advisory window. Tasks 1 and 4 changed as a result.
+**Revised again:** 2026-09-22 — two triggers instead of one, at the owner's
+direction: a 15-minute schedule *and* a re-read on credential rejection. Adds the
+failure-callback module (new task 4) and a `litellm_config.yaml` change that the
+previous revision had ruled out. The "scheduled job" is implemented inside the
+credential provider rather than as a timer, for reasons recorded under trigger 1.
 **Scope:** make the running proxy observe a rewritten `~/.env.aws` **without a
-process restart**, instead of up to 300s later plus a restart. Re-reads happen on
-a bounded delay rather than per request: `REREAD_DELAY` is both the interval
-between re-reads and the worst-case lag between a person rewriting the file and
-the proxy using it.
+process restart**, instead of up to 300s later plus a restart. Two re-read
+triggers, per the owner's direction:
+
+1. **Scheduled** — re-read at least every 15 minutes, unconditionally.
+2. **On error** — re-read when a request to the LLM fails with a credential
+   rejection, rather than waiting out the schedule.
+
+Neither is per-request. Trigger 2 has its own cooldown for exactly that reason; see
+the two trigger sections under Design.
 
 ## Out of scope
 
@@ -34,6 +44,10 @@ so it cannot be run on a timer. Two consequences shape the design:
   the container can do makes expired credentials work, and only a person can
   change that. So the file is re-read on a **delay**, at most once per
   `REREAD_DELAY`, not once per failed request.
+- A credential rejection is nonetheless the **strongest available signal** that the
+  file is worth re-reading, so it triggers one too — bounded by its own cooldown,
+  which is what keeps "re-read on error" from collapsing back into "re-read per
+  request" during a long expired window.
 
 One precondition on the no-operator-action property, stated here because it
 constrains the whole design: it holds when the file is rewritten **in place**. A
@@ -96,8 +110,12 @@ Stop feeding credentials through the environment. Use botocore's
   supplying AWS credentials as environment variables. Both matter: botocore's
   environment provider outranks the profile, so a leftover `AWS_ACCESS_KEY_ID`
   in the container env silently wins and the shim is never consulted.
-- **`litellm_config.yaml`** is left unchanged — see below; the absence of
-  `aws_*` credential params is what selects the right code path.
+- **Failure callback** (`scripts/aws_credential_refresh.py`, mounted) invalidates the
+  cached credentials when AWS rejects them, so the next request re-reads the file
+  instead of waiting out the schedule. This is trigger 2.
+- **`litellm_config.yaml`** gains exactly one thing: `litellm_settings.callbacks`
+  registering that callback. No model entry changes — the absence of `aws_*`
+  credential params is what selects the right code path.
 - **`entrypoint.sh`** collapses to `exec litellm ...`; the FIFO, flag file,
   cooldown, and checksum loop are deleted.
 
@@ -140,7 +158,7 @@ while pickup stays correct and gets *faster*. Nothing about correctness rests on
 the cache. A longer TTL is equally harmless, because the cached object is
 refreshable and botocore's schedule still governs re-reads.
 
-### `Expiration` is the re-read schedule
+### Trigger 1 — scheduled: `Expiration` is the re-read schedule
 
 `~/.env.aws` contains only `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
 `AWS_SESSION_TOKEN`, `AWS_DEFAULT_REGION` — inspected 2026-09-22, and there is **no
@@ -161,9 +179,43 @@ advisory refresh window, the interval between re-reads is set by placing
 Expiration = now + ADVISORY_WINDOW + REREAD_DELAY
 ```
 
-`REREAD_DELAY` is then exactly the re-read interval, and hence the worst-case lag
-between a person rewriting the file and the proxy using it. Implemented as
-`REREAD_DELAY = 60s`, overridable and bounded to `[1, 600]`.
+`REREAD_DELAY` is then the re-read interval, and hence the worst-case lag between a
+person rewriting the file and the proxy using it. Set to **900s** to meet the
+15-minute requirement, overridable and bounded to `[1, 900]` — the upper bound *is*
+the requirement, so a larger value would silently break it.
+
+#### Why no cron job, and why the interval is really ~600s
+
+The requirement says "scheduled job". This is a schedule, but not a separate timer,
+for two reasons — one structural, one measured.
+
+**Structural:** an external process cannot hand credentials to a running botocore
+session. There is exactly one way into that session's credential state, and it is
+this `credential_process` hook. A cron job inside the container could re-read the
+file all day and the proxy would not see it. So the schedule has to live where the
+credentials are resolved, which is here.
+
+**Measured:** there are *two* caches in series, and the shorter one wins.
+`_get_or_set_cached_credentials` stores the ambient-env credentials with `ttl=None`,
+which `InMemoryCache.set_cache` resolves to `default_ttl` — **600s**
+(`base_aws_llm.py:291-293`). When that entry lapses, the next request calls
+`_auth_with_env_vars`, which builds a **fresh `boto3.Session`**
+(`base_aws_llm.py:1451-1460`); a fresh session resolves credentials from scratch, so
+it runs the shim. That happens every ≤600s no matter what `Expiration` says.
+
+So the effective re-read interval is `min(600, REREAD_DELAY)`, and with
+`REREAD_DELAY = 900` the observed cadence is **~600s / 10 minutes — tighter than the
+15 minutes asked for.** `REREAD_DELAY` only becomes the binding constraint if set
+below 600. Both bounds are therefore stated, and V9 records the measured interval
+rather than asserting either number: litellm's 600s default is not configurable from
+`litellm_config.yaml`, so it is an observation about the image, not a setting, and
+`main-latest` can move it.
+
+One consequence worth stating: re-reads are **lazy** — driven by a request arriving,
+not by a clock. Idle proxy, no re-reads. That is not a gap: the first request after
+any idle gap longer than the interval re-reads before it authenticates, because the
+window has already elapsed. Credentials are only needed at request time, so a timer
+firing into an idle process would buy nothing.
 
 No expiry comparison and no floor: there is nothing in the file to compare
 against, and a timestamp this far ahead is never in the past. The earlier
@@ -183,6 +235,63 @@ Consequences, stated plainly:
   timestamp was never a validity claim — if those credentials are good the request
   succeeds, and if they are expired AWS rejects it. This reverses an earlier
   preference for the mandatory window, which assumed per-fetch re-reads.
+
+### Trigger 2 — on error: re-read when AWS rejects the credentials
+
+Trigger 1 alone means a person can refresh the file and still wait out the interval.
+A credential rejection is the strongest signal available that re-reading is worth
+doing, so it forces one.
+
+**botocore will not do this by itself.** An `ExpiredTokenException` comes back from
+the Bedrock call, long after credentials were resolved; botocore does not invalidate
+them and retry. Something above it has to react.
+
+The insertion point is litellm's failure hook. A `CustomLogger` subclass registered
+in `litellm_settings.callbacks` implements
+`async_post_call_failure_hook(request_data, original_exception, user_api_key_dict, traceback_str=None)`
+(`custom_logger.py:452-470`), dispatched for every registered callback on LLM call
+failure (`proxy/utils.py:3120-3141`). On a credential rejection it drops the cached
+credentials so the next request re-resolves them — which, per Trigger 1's second
+cache, means a fresh `boto3.Session` and a shim invocation, i.e. a file re-read.
+
+Four constraints on that hook, each load-bearing:
+
+- **Cooldown, or this becomes per-request churn.** During an expired window *every*
+  request fails, so an unguarded hook would invalidate on every one of them and
+  re-read the file per request — exactly the behaviour this plan exists to remove.
+  At most one error-triggered re-read per `ERROR_REREAD_COOLDOWN` (default 60s),
+  held as a monotonic timestamp in the callback module. A burst of N failures
+  produces one re-read.
+- **Narrow the trigger to credential rejections.** Match `ExpiredToken`,
+  `ExpiredTokenException`, `InvalidClientTokenId`, `UnrecognizedClientException`.
+  Not `AccessDeniedException` — that is a policy problem, and re-reading the file
+  cannot fix a missing permission, so treating it as a refresh signal would re-read
+  on every denied request forever.
+- **Invalidate the cache litellm actually reads.** `BaseAWSLLM._shared_iam_cache` is
+  a `ClassVar` `DualCache` shared process-wide (`base_aws_llm.py:227-241`), so
+  `flush_cache()` (`dual_cache.py:500`) reaches every instance. Targeted
+  `delete_cache(key)` would be neater but needs `get_cache_key(credential_args)`
+  rebuilt from the deployment's args, which the hook does not reliably have; a flush
+  costs at most one extra shim invocation per AWS deployment, so take the flush.
+- **Failures here are silent.** litellm catches and logs exceptions from this hook
+  and continues (`proxy/utils.py:3145-3148`). A wrong import path or a renamed
+  attribute therefore yields a hook that never fires, with requests still working —
+  the failure is invisible from the outside. V10 must prove it fires rather than
+  assume it, and the hook must log its own no-op path (names and reasons only, never
+  credential values).
+
+This trigger depends on the same `AWS_PROFILE` choice as everything else: there is
+only something to invalidate because the ambient-env path is cached. On the
+`aws_profile_name` path litellm caches nothing, so there would be no handle to pull.
+
+### Risk: private litellm internals on a moving tag
+
+Trigger 2 reaches into `BaseAWSLLM._shared_iam_cache` — a private attribute, in an
+image pinned to `main-latest`. A rename breaks the trigger **silently**, per the
+point above. So the hook resolves it defensively (`getattr`, no bare attribute
+access), logs loudly when it cannot find it, and V10 is re-run after any image
+update. Trigger 1 keeps working regardless, which bounds the damage to "back to the
+15-minute schedule" rather than "no refresh at all".
 
 ### Risk: `ADVISORY_WINDOW` is a botocore constant, not a contract
 
@@ -323,29 +432,41 @@ not shipped.
    failure message must name the likely cause and the fix: the mount was detached
    by a host-side replacement, recover with `docker compose restart`. Safe under
    concurrent invocation: no shared temp or lock files. Never echo secret values to
-   stderr or logs. The
-   `REREAD_DELAY` override must be validated and bounded — an override able to
-   exceed `[1, 600]` would make the staleness bound the delay exists to define
-   arbitrarily large. **Already implemented against the superseded cap-and-floor
-   contract; this task is now a revision of an existing file, not new work.**
+   stderr or logs. `REREAD_DELAY` defaults to **900s** and must be validated and
+   bounded to `[1, 900]` — an override able to exceed that would push the staleness
+   bound past the 15 minutes the requirement sets.
+   **Already implemented against the superseded cap-and-floor contract; this task is
+   now a revision of an existing file, not new work.**
 2. `scripts/aws-config` — single profile with `credential_process`. Done.
-3. `docker-compose.yml` — mount shim and config, set `AWS_CONFIG_FILE` **and
-   `AWS_PROFILE`**, keep the existing single-file credentials mount, and stop
-   supplying AWS credentials via `env_file`. No `AWS_ACCESS_KEY_ID`,
+3. `docker-compose.yml` — mount shim, AWS config **and the callback module**, set
+   `AWS_CONFIG_FILE` **and `AWS_PROFILE`**, put the callback's directory on
+   `PYTHONPATH` so litellm can import it, keep the existing single-file credentials
+   mount, and stop supplying AWS credentials via `env_file`. No `AWS_ACCESS_KEY_ID`,
    `AWS_SECRET_ACCESS_KEY` or `AWS_SESSION_TOKEN` may remain in the container
    environment: botocore's env provider outranks the profile and would shadow the
    shim entirely. Mounting `$HOME` (or any parent of it) is prohibited.
-4. `litellm_config.yaml` — **no change.** Verify only that no entry sets an
-   `aws_*` credential param, since that is what keeps every model on the cached
-   ambient-credentials branch.
-5. `entrypoint.sh` — reduce to `exec litellm`. This also removes the startup
+4. `scripts/aws_credential_refresh.py` — **new.** `CustomLogger` subclass
+   implementing `async_post_call_failure_hook`, per trigger 2: match only the four
+   credential-rejection codes, enforce `ERROR_REREAD_COOLDOWN` (default 60s) via a
+   monotonic clock, resolve `BaseAWSLLM._shared_iam_cache` defensively and
+   `flush_cache()` it. Must never raise into the caller's path, never log credential
+   values, and log the reason whenever it declines to act (cooldown active, code not
+   matched, cache attribute missing) — silent no-ops here are indistinguishable from
+   success. Expose a module-level instance for the config to reference.
+5. `litellm_config.yaml` — register the callback under `litellm_settings.callbacks`.
+   No model entry changes; verify no entry sets an `aws_*` credential param, since
+   that is what keeps every model on the cached ambient-credentials branch — and
+   trigger 2 has nothing to invalidate without it.
+6. `entrypoint.sh` — reduce to `exec litellm`. This also removes the startup
    `source` of the credentials file, which is required, not incidental: those
    exported variables would otherwise shadow the profile.
-6. `README.md` — document the mechanism, quote the V9 measured re-read interval
-   and name `REREAD_DELAY` as the worst-case pickup lag, state the
-   `ADVISORY_WINDOW = 900s` botocore assumption from V8, and state the constraint
+7. `README.md` — document **both triggers**, quote the V9 measured re-read interval
+   rather than the nominal 900s (it will be ~600s, and say why: litellm's
+   non-configurable credential cache TTL), state the `ADVISORY_WINDOW = 900s`
+   botocore assumption from V8, and state the constraint
    that adding an `aws_*` credential param to a model silently reverts to
-   per-request re-reads. Document the single-file mount caveat as a **procedure**,
+   per-request re-reads and disables trigger 2. Record that trigger 2 depends on a
+   private litellm attribute, so an image update warrants re-running V10. Document the single-file mount caveat as a **procedure**,
    not just a warning: if the credentials file is replaced rather than rewritten in
    place, requests fail with `CredentialRetrievalError` naming the shim, and
    `docker compose restart` is the recovery — and say why `up -d` is not, since
@@ -367,12 +488,27 @@ Runtime evidence required; source inspection is not sufficient.
   A "replaces" result makes the dedicated directory a required task, per the mount
   decision above; this verification therefore cannot be skipped or deferred past
   completion.
-- **V9 — the delay is real: re-reads are not per request.** The central check for
-  this requirement. Have the shim append a timestamp to a counter file, issue N
-  requests well inside one `REREAD_DELAY`, and confirm the invocation count is ~1,
-  not N. Then run for several delay periods and confirm the interval between
-  invocations is `REREAD_DELAY`, not shorter. Record the image digest, since the
-  cache this relies on is internal litellm behaviour.
+- **V9 — the scheduled interval, measured.** The central check for trigger 1. Have the
+  shim append a timestamp to a counter file, issue N requests inside one interval, and
+  confirm the invocation count is ~1, not N. Then run across several intervals and
+  record the **actual** spacing. Expect ~600s, not 900s, per the two-cache analysis —
+  and treat a measurement near 900s as evidence that litellm's cache TTL moved, which
+  changes the documented bound. Anything ≤900s satisfies the requirement; the number
+  goes in the README. Record the image digest: the cadence depends on internal litellm
+  behaviour, not on config.
+- **V10 — trigger 2 fires, and only when it should.** Four parts, because the hook
+  fails silently (litellm swallows its exceptions). (a) With expired credentials in
+  the file, issue one request, confirm it fails at AWS, then confirm a shim invocation
+  follows the failure rather than the schedule — the counter advances within seconds,
+  not 600s. (b) Rewrite the file with valid credentials during an expired window and
+  confirm the **next** request after the cooldown succeeds, well inside one scheduled
+  interval; this is the whole point of the trigger. (c) Issue a burst of N failing
+  requests inside one `ERROR_REREAD_COOLDOWN` and confirm exactly one extra
+  invocation, not N — the cooldown is what stops this being per-request churn.
+  (d) Provoke a non-credential failure (bad model name, or a policy
+  `AccessDeniedException` if one can be arranged) and confirm **no** invalidation.
+  Also confirm the hook logs its decisions and that no credential value appears in
+  those logs.
 - **V8 — the botocore advisory window really is 900s.** `docker exec` a read of
   `botocore.credentials.RefreshableCredentials._advisory_refresh_timeout` in the
   running image. If it is not 900, the emitted `Expiration` must be recomputed from
@@ -385,9 +521,12 @@ Runtime evidence required; source inspection is not sufficient.
   the operating model. Point the file at expired credentials, leave it expired
   across several request attempts, confirm each fails cleanly and the proxy stays
   up and does not restart-loop; then rewrite with valid credentials and confirm
-  the **next** request issued after one `REREAD_DELAY` succeeds, with no restart
-  and no operator action. Each failure must be AWS's own `ExpiredTokenException`,
-  which confirms detection is happening at AWS and not locally.
+  recovery with no restart and no operator action. Each failure must be AWS's own
+  `ExpiredTokenException`, which confirms detection is happening at AWS and not
+  locally. Recovery is bounded twice over: by `ERROR_REREAD_COOLDOWN` if any request
+  was attempted after the rewrite (trigger 2), and by the scheduled interval
+  regardless (trigger 1). Assert the **trigger 1 bound** here — V10(b) covers the
+  faster path — so this verification still passes if trigger 2 is broken.
 - **V4b — the profile is actually in use.** Regression guard for the shadowing
   trap. Assert no `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY` or
   `AWS_SESSION_TOKEN` is present in the container environment, and that credentials
