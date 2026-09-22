@@ -150,7 +150,7 @@ in opposite directions, so they must be settled together.
 (`~/.env.aws`). Docker resolves that to an inode at container start. If the host
 script writes a temp file and `mv`s it into place, the inode changes and **the
 container keeps reading the old file indefinitely** — no amount of shim polling
-helps. Mounting the enclosing *directory* instead makes replacement visible.
+helps. Mounting the *directory* that contains the file makes replacement visible.
 
 **Torn reads.** If the host script truncates and rewrites in place, a concurrent
 reader can observe a partial file. Truncated JSON is the benign case, caught by
@@ -162,24 +162,46 @@ error. This plan makes the exposure materially worse: the shim is invoked per
 request (Mechanism B), so concurrent traffic means many concurrent readers, each
 a chance to land in the rewrite window.
 
-These two combine to a single preferred shape:
+### Hard constraint: `$HOME` must never be mounted
 
-- **Preferred — atomic replace (`mv`) + mount the enclosing directory.** Every
-  `open()` sees a complete, self-consistent file, so torn reads are impossible by
-  construction, and directory mounting makes the new inode visible. This is the
-  only option that resolves *both* risks without depending on the shim getting
-  concurrency right.
-- **Fallback — in-place rewrite + file mount.** Keeps the current mount but
-  leaves the torn-read window open. Then the shim must additionally reject
-  inconsistent payloads rather than merely incomplete ones: read the file in a
-  single pass, and require a completeness marker written last (a trailing
-  sentinel line) so a torn read is detectable. That marker is a change to the
-  host script, which this plan does not own — so this path needs the script
-  owner's agreement.
+`~/.env.aws` sits **directly in the home directory**, so "mount the containing
+directory" would bind-mount all of `$HOME` into the container. That is ruled out
+categorically, not weighed as a tradeoff. It would expose `~/.aws/credentials`,
+`~/.ssh`, and `~/.midway/cookie` — and that cookie carries the ~20h Midway
+session, which is *more* sensitive and longer-lived than the ~12h Bedrock
+credentials the mount exists to deliver. Read-only does not help: the risk is
+disclosure, not modification. Any option requiring a `$HOME` mount is rejected
+regardless of what it buys.
 
-Settle empirically via V1 before finalizing the mount. If the script currently
-rewrites in place, the smaller and safer change is to switch it to
-write-temp-then-`mv` rather than to add sentinel handling to the shim.
+So directory mounting is only available if the credentials live in a
+**dedicated** directory holding nothing else.
+
+### Resulting options
+
+- **Preferred — dedicated directory + atomic replace (`mv`).** The host script
+  writes into a directory created solely for this (e.g.
+  `~/.config/litellm-proxy/`), and only that directory is mounted. Then every
+  `open()` sees a complete, self-consistent file — torn reads impossible by
+  construction — and inode replacement is visible. Resolves both risks without
+  the shim needing to handle concurrency, and without exposing anything beyond
+  the credentials themselves.
+
+  Cost: the host script must write to the new path. Note `~/.zshrc:172` sources
+  `~/.env.aws`, so that path has consumers outside this repo and cannot simply be
+  moved — the script would need to write both locations, or the new path becomes
+  the source and `~/.env.aws` a copy. Requires the script owner's agreement.
+
+- **Fallback — keep the existing single-file mount, in-place rewrite.** No new
+  path and no `$HOME` exposure, but atomic replace is unavailable (it would break
+  the mount via inode replacement) and the torn-read window stays open. The shim
+  must then reject *inconsistent* payloads, not merely incomplete ones: single-pass
+  read plus a completeness marker written last, so a torn read is detectable.
+  Also requires a host-script change, of comparable size to the preferred option.
+
+Both paths need the script owner to change something, so the choice is not
+"cheap vs expensive" — it is which guarantee is wanted. Prefer the dedicated
+directory: it makes torn reads structurally impossible instead of detectable
+after the fact. Settle empirically via V1 before finalizing.
 
 The shim must also be safe under concurrent invocation in its own right: no
 shared temp files, no lock files that can deadlock or leave stale locks. The V2
@@ -198,6 +220,8 @@ not shipped.
 2. `scripts/aws-config` — single profile with `credential_process`.
 3. `docker-compose.yml` — mount shim and config, set `AWS_CONFIG_FILE`, settle
    the mount shape per V1, and stop supplying AWS credentials via `env_file`.
+   The mount must name either the single credentials file or a dedicated
+   directory; mounting `$HOME` (or any parent of it) is prohibited.
 4. `litellm_config.yaml` — add `aws_profile_name` to the six Bedrock entries.
 5. `entrypoint.sh` — reduce to `exec litellm`.
 6. `README.md` — document the mechanism, quote the V2b guaranteed staleness
@@ -244,6 +268,10 @@ Runtime evidence required; source inspection is not sufficient.
   the chosen shape actually delivers that.
 - **V6 — baseline.** `curl -f http://localhost:8000/health` passes and a
   completion against `claude-sonnet-4-5` succeeds.
+- **V7 — mount surface.** Inspect the running container's mounts and confirm the
+  only host path exposed is the credentials file or its dedicated directory.
+  Specifically assert `~/.aws`, `~/.ssh` and `~/.midway` are **not** reachable
+  from inside the container.
 
 ## Open question
 
