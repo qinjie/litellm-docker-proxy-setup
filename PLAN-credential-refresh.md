@@ -216,7 +216,10 @@ not shipped.
    non-zero with a stderr message if any of the three credential fields is
    missing, the file is unreadable, or (fallback shape only) the completeness
    marker is absent. Safe under concurrent invocation: no shared temp or lock
-   files. Never echo secret values to stderr or logs.
+   files. Never echo secret values to stderr or logs. If `CAP` is overridable,
+   the override must be validated and bounded — an override able to exceed the
+   refresh windows would silently reintroduce the unbounded staleness the cap
+   exists to prevent.
 2. `scripts/aws-config` — single profile with `credential_process`.
 3. `docker-compose.yml` — mount shim and config, set `AWS_CONFIG_FILE`, settle
    the mount shape per V1, and stop supplying AWS credentials via `env_file`.

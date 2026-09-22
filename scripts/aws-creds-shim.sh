@@ -13,10 +13,23 @@ ENV_FILE="${LITELLM_AWS_ENV_FILE:-/app/env.aws}"
 # instead of silently serving stale credentials.
 CAP_SECONDS="${LITELLM_CREDS_CAP_SECONDS:-120}"
 
+# Upper bound of the mandatory window. Past it both properties above are lost, so
+# an override may not exceed it -- the cap is the whole staleness guarantee.
+CAP_SECONDS_MAX=600
+
 die() {
   printf 'aws-creds-shim: %s\n' "$1" >&2
   exit 1
 }
+
+# Rejected rather than clamped: this is static misconfiguration, and a warning on
+# stderr would likely be swallowed by botocore and go unnoticed.
+case "$CAP_SECONDS" in
+  '' | *[!0-9]*) die "LITELLM_CREDS_CAP_SECONDS must be a positive integer, got: $CAP_SECONDS" ;;
+  0*) die "LITELLM_CREDS_CAP_SECONDS must not be zero or zero-padded, got: $CAP_SECONDS" ;;
+esac
+[ "$CAP_SECONDS" -le "$CAP_SECONDS_MAX" ] ||
+  die "LITELLM_CREDS_CAP_SECONDS must be <= $CAP_SECONDS_MAX, got: $CAP_SECONDS"
 
 [ -r "$ENV_FILE" ] || die "credentials file not readable: $ENV_FILE"
 
