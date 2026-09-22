@@ -2,8 +2,10 @@
 
 **Status:** proposed
 **Date:** 2026-09-22
-**Scope:** make the running proxy observe a rewritten `~/.env.aws` within one
-request, instead of up to 300s later plus a process restart.
+**Scope:** make the running proxy observe a rewritten `~/.env.aws` promptly and
+**without a process restart**, instead of up to 300s later plus a restart. The
+guaranteed bound is set by the `Expiration` refresh schedule (Mechanism A); the
+common case is faster (Mechanism B), but that is not promised.
 
 ## Out of scope
 
@@ -58,34 +60,52 @@ Stop feeding credentials through the environment. Use botocore's
 - **`entrypoint.sh`** collapses to `exec litellm ...`; the FIFO, flag file,
   cooldown, and checksum loop are deleted.
 
-### Why pickup becomes per-request
+### Two independent reasons pickup is fast
 
-litellm's `base_aws_llm.py` special-cases `aws_profile_name`: it calls
-`_auth_with_aws_profile` directly, **bypassing `_get_or_set_cached_credentials`,
-so a fresh `boto3.Session` is built per invocation and the profile is re-resolved
-from disk each time**. The shim therefore runs per request, and a rewritten
-`~/.env.aws` is in effect on the next request.
+**Mechanism A — botocore refresh (load-bearing).** `ProcessProvider` returns
+`RefreshableCredentials` when the payload carries `Expiration`, and re-invokes
+the shim once the remaining lifetime falls inside botocore's advisory refresh
+window (15 minutes). The shim will therefore always emit an `Expiration` set a
+short interval ahead — inside that window — so refresh is attempted on
+effectively every credential fetch, *within a single long-lived session*. This
+holds no matter how litellm caches.
 
-This must be confirmed against the running container, not assumed from source —
-see Verification V2.
+**Mechanism B — litellm re-resolving per call (observed, not contracted).**
+On `main`, `base_aws_llm.py:482-484` dispatches the `aws_profile_name` branch to
+`_auth_with_aws_profile` and returns directly, **not** through
+`_get_or_set_cached_credentials` as the other four auth branches do; and
+`base_aws_llm.py:1393-1402` builds a fresh `boto3.Session(profile_name=...)` per
+call. So the profile is re-resolved from disk each request.
 
-### The missing `Expiration` field
+Mechanism B is the faster of the two, but it is **internal behaviour, not a
+documented contract**, and `docker-compose.yml:3` pins `main-latest` — a moving
+tag. A future image could reintroduce caching on this path and silently
+regress it. The design must remain correct on Mechanism A alone; B is an
+optimisation, and the plan does not promise next-request pickup on its basis.
+
+### `Expiration` is required, and `~/.env.aws` lacks it
 
 `~/.env.aws` contains only `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`,
 `AWS_SESSION_TOKEN`, `AWS_DEFAULT_REGION`. botocore's `ProcessProvider` treats a
-payload **without** `Expiration` as static, non-refreshable credentials.
+payload **without** `Expiration` as static, non-refreshable credentials — which
+would disable Mechanism A entirely and leave freshness resting solely on the
+un-contracted Mechanism B. The shim must therefore always emit one:
 
-Since per-request re-invocation (above) is what delivers freshness, `Expiration`
-is not load-bearing here. The shim will:
+- pass through `AWS_CREDENTIAL_EXPIRATION` when the host script provides it;
+- otherwise synthesize an expiry a short interval ahead, chosen to sit inside
+  the 15-minute advisory window so refresh is attempted continuously.
 
-- pass through `AWS_CREDENTIAL_EXPIRATION` when present, and
-- otherwise synthesize a short expiry, so botocore treats the credentials as
-  refreshable rather than pinning them for the life of a session.
+Tradeoff to settle in implementation: botocore also has a 10-minute *mandatory*
+window, inside which a failed refresh raises instead of serving the existing
+credentials. A synthesized expiry short enough to force frequent refresh also
+sits in or near that window, so a transient unreadable file surfaces as a failed
+request rather than silent staleness. That is the preferable failure mode here,
+but the chosen interval must be recorded with its reasoning.
 
-Optional, owned by the host script and not required by this plan: emit
+Worth doing, though owned by the host script and not required by this plan: emit
 `AWS_CREDENTIAL_EXPIRATION` (the `Expiration` that `isengardcli` already
-returns) into `~/.env.aws`. That lets botocore refresh ahead of real expiry
-rather than relying on per-request re-resolution.
+returns) into `~/.env.aws`. That replaces a synthesized guess with the real
+expiry, so botocore refreshes ahead of actual expiry.
 
 ## Risk: bind-mounted file and inode replacement
 
@@ -115,8 +135,9 @@ must fail cleanly on a malformed read rather than emit truncated JSON.
    the mount shape per V1, and stop supplying AWS credentials via `env_file`.
 4. `litellm_config.yaml` — add `aws_profile_name` to the six Bedrock entries.
 5. `entrypoint.sh` — reduce to `exec litellm`.
-6. `README.md` — document the mechanism and the optional
-   `AWS_CREDENTIAL_EXPIRATION` line.
+6. `README.md` — document the mechanism, quote the V2b guaranteed staleness
+   bound rather than the faster V2 combined figure, and describe the
+   `AWS_CREDENTIAL_EXPIRATION` line the host script should emit.
 
 ## Verification
 
@@ -125,9 +146,16 @@ Runtime evidence required; source inspection is not sufficient.
 - **V1 — inode behaviour.** Identify how the host script writes `~/.env.aws`
   (in-place vs `mv`). With the container up, rewrite the file and `docker exec`
   a read to confirm the container observes new content. Settles task 3.
-- **V2 — per-request invocation.** Have the shim append a timestamp to a
-  counter file, issue N requests, assert the count advances — proving the shim
-  is re-invoked per request rather than cached for the process lifetime.
+- **V2 — shim re-invocation, and which mechanism supplies it.** Have the shim
+  append a timestamp to a counter file, then issue N requests and record how
+  many invocations result. This measures the *combined* effect of Mechanisms A
+  and B; it does not by itself distinguish them. Record the observed ratio and
+  the image digest it was measured against, since Mechanism B is not contracted.
+- **V2b — staleness bound without Mechanism B.** Establish the worst case if
+  litellm reintroduces caching on the profile path: hold one session open and
+  confirm the shim is still re-invoked on the `Expiration`-driven schedule
+  alone. This is the number the design actually guarantees, and it is what the
+  README should quote — not V2's faster combined figure.
 - **V3 — no-restart pickup.** Record litellm's PID, rewrite `~/.env.aws` with
   valid fresh credentials, issue a request, confirm it succeeds **and** the PID
   is unchanged.
