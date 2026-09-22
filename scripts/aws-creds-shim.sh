@@ -17,6 +17,14 @@ CAP_SECONDS="${LITELLM_CREDS_CAP_SECONDS:-120}"
 # an override may not exceed it -- the cap is the whole staleness guarantee.
 CAP_SECONDS_MAX=600
 
+# Floor on how near the emitted Expiration may be. The emitted value schedules
+# botocore's next re-read; AWS remains the authority on whether the credentials
+# actually work. A value at or before now would have botocore treat them as
+# already expired and churn on refresh, instead of attempting the request and
+# surfacing a clean ExpiredToken per request -- which is the intended behaviour
+# while the file genuinely holds expired credentials.
+CAP_SECONDS_MIN=30
+
 die() {
   printf 'aws-creds-shim: %s\n' "$1" >&2
   exit 1
@@ -28,6 +36,8 @@ case "$CAP_SECONDS" in
   '' | *[!0-9]*) die "LITELLM_CREDS_CAP_SECONDS must be a positive integer, got: $CAP_SECONDS" ;;
   0*) die "LITELLM_CREDS_CAP_SECONDS must not be zero or zero-padded, got: $CAP_SECONDS" ;;
 esac
+[ "$CAP_SECONDS" -ge "$CAP_SECONDS_MIN" ] ||
+  die "LITELLM_CREDS_CAP_SECONDS must be >= $CAP_SECONDS_MIN, got: $CAP_SECONDS"
 [ "$CAP_SECONDS" -le "$CAP_SECONDS_MAX" ] ||
   die "LITELLM_CREDS_CAP_SECONDS must be <= $CAP_SECONDS_MAX, got: $CAP_SECONDS"
 
@@ -62,7 +72,8 @@ REAL_EXPIRATION=$(field AWS_CREDENTIAL_EXPIRATION)
 [ -n "$SECRET_ACCESS_KEY" ] || die "AWS_SECRET_ACCESS_KEY missing or empty in $ENV_FILE"
 [ -n "$SESSION_TOKEN" ] || die "AWS_SESSION_TOKEN missing or empty in $ENV_FILE"
 
-CAP_EPOCH=$(($(date -u +%s) + CAP_SECONDS))
+NOW_EPOCH=$(date -u +%s)
+CAP_EPOCH=$((NOW_EPOCH + CAP_SECONDS))
 EXPIRY_EPOCH=$CAP_EPOCH
 if [ -n "$REAL_EXPIRATION" ]; then
   # Honour a nearer real expiry; never let it push the re-read further out.
@@ -71,6 +82,10 @@ if [ -n "$REAL_EXPIRATION" ]; then
     EXPIRY_EPOCH=$REAL_EPOCH
   fi
 fi
+# Expired or nearly-expired credentials are an expected state here, so floor the
+# schedule rather than emitting a past timestamp.
+FLOOR_EPOCH=$((NOW_EPOCH + CAP_SECONDS_MIN))
+[ "$EXPIRY_EPOCH" -ge "$FLOOR_EPOCH" ] || EXPIRY_EPOCH=$FLOOR_EPOCH
 EXPIRATION=$(date -u -d "@$EXPIRY_EPOCH" +%Y-%m-%dT%H:%M:%SZ)
 
 printf '{"Version":1,"AccessKeyId":"%s","SecretAccessKey":"%s","SessionToken":"%s","Expiration":"%s"}\n' \
