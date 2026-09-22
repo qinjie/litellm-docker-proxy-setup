@@ -206,7 +206,8 @@ old contents:
 | in-place rewrite (truncate) | new contents, same inode — works |
 | `mv` replacement | `cat`: **No such file or directory** |
 | `rm` + recreate | `cat`: **No such file or directory** |
-| `docker restart` after either | new contents, new inode — recovered |
+| `docker compose restart` after either | new contents, new inode — recovered |
+| `docker compose up -d` after either | reports `Running`, **still broken** |
 
 So replacement fails **loudly and recoverably**, not silently, and the shim already
 handles it: `cat` fails and it dies with `failed to read <path>`. Note that
@@ -279,7 +280,9 @@ after the fact.
 **Decision, so tasks 3-5 are not blocked:** land the switchover on the **existing
 single-file mount**, unchanged. Two reasons, in order of weight. First the
 measurement above: replacement surfaces as a clear per-request error naming its own
-fix, not as indefinite silent staleness, and `docker compose up -d` recovers it.
+fix, not as indefinite silent staleness, and `docker compose restart` recovers it.
+It must be `restart`: `up -d` on an unchanged config and image is a no-op — measured,
+it reports `Running` and leaves the mount detached.
 Second, it is already what the repo does (`docker-compose.yml:17`), so nothing
 regresses — today's checksum poller reads the same mounted path.
 
@@ -301,7 +304,7 @@ not shipped.
    missing or the file is unreadable. Because that stderr is what the operator
    actually sees (it arrives verbatim in `CredentialRetrievalError`), the read
    failure message must name the likely cause and the fix: the mount was detached
-   by a host-side replacement, recover with `docker compose up -d`. Safe under
+   by a host-side replacement, recover with `docker compose restart`. Safe under
    concurrent invocation: no shared temp or lock files. Never echo secret values to
    stderr or logs. The
    `REREAD_DELAY` override must be validated and bounded — an override able to
@@ -328,7 +331,8 @@ not shipped.
    per-request re-reads. Document the single-file mount caveat as a **procedure**,
    not just a warning: if the credentials file is replaced rather than rewritten in
    place, requests fail with `CredentialRetrievalError` naming the shim, and
-   `docker compose up -d` is the recovery.
+   `docker compose restart` is the recovery — and say why `up -d` is not, since
+   that is the command an operator will reach for first.
 
 ## Verification
 
