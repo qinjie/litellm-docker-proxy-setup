@@ -31,7 +31,7 @@ Two containers were used:
 | V3 | Pickup without restarting the process | PASS |
 | V5b | Torn read under concurrent load | PASS for key-pair consistency; truncated tokens rejected since review round 3; 1s stale view measured |
 | V10b | Recovery after an in-place rewrite | PASS — 70s |
-| V4 | Prolonged expired window, trigger-1 bound | blocked by VM memory; as predicted up to tr+389 |
+| V4 | Prolonged expired window, trigger-1 bound | PASS — first 200 at tr+491 (attempt 2; attempt 1 blocked by VM memory) |
 | V1 | Inode behaviour against the real container. **Release gate** | PASS |
 
 ## V8 — the constants are real
@@ -325,7 +325,8 @@ from `~/.env.aws` into a mode-600 temp file that was deleted afterwards:
 | harness counter directory | — | 0 | — |
 
 That closes V10's "no credential value appears in those logs". The harness figure
-covers the whole V4 container. It held the real credentials from the rewrite at tc+122
+covers the whole V4 attempt 1 container ([attempt 2](#v4-attempt-2--pass) has its own
+count). It held the real credentials from the rewrite at tc+122
 until it stopped, and it was counted after the stop.
 `--force-recreate` discarded the earlier harness containers' logs. There was no
 application log to grep. `litellm_config.yaml` asks for JSON logs at
@@ -406,7 +407,7 @@ run (9 times in 4s). The event loop was not blocked (`/health/liveliness` answer
 and the probe itself — no shim, no `cat`. A clean re-run of the identical sequence took 5.0s. Releasing all
 three together points at a shared stall, not per-request retries. It happened on a VM
 that had been OOM-killing processes shortly before, which is the most likely factor,
-but that is not shown. A second stall, in V4 below, hit with the VM at 52 MB available
+but that is not shown. A second stall, in V4 attempt 1 below, hit with the VM at 52 MB available
 and `docker exec` into the harness hanging as well. That places it in the VM rather than
 in litellm. It still does not prove the cause.
 
@@ -465,11 +466,38 @@ What was measured:
 So the run says nothing about the trigger-1 bound: the stall started just before the
 point it was meant to measure.
 
-It cannot be re-run on this VM as it stands. With the harness stopped, the VM has
+At the time it could not be re-run: with the harness stopped, the VM had
 about 520 MB available. A second litellm needs about as much as production's 477 MiB,
-which puts the VM back at the ~50 MB point where both stalls happened. A re-run needs
-that headroom freed first: stop the news-agg stack, turn off Kubernetes, or give the VM
-more memory.
+which put the VM back at the ~50 MB point where both stalls happened. The VM was given
+more memory, and V4 was re-run as attempt 2.
+
+## V4, attempt 2 — PASS
+
+By 2026-09-23 03:14Z the VM had 12 GiB (`MemTotal` 12232448 kB) and about 3.0 GiB
+available, so the same `~/litellm-verify/v4.sh` was re-run unchanged. The harness
+mounted the repo's files at commit 8ad9789: the newline-checking shim, and the
+entrypoint that logged `botocore advisory refresh window is 900s`. Mid-run the VM had
+about 2 GiB available, with the harness at 519 MiB.
+
+- req1 and req2 returned 403, and the shim count went 0 → 1 → 2. req2 re-read the
+  fabricated file and filled the 600s cache.
+- **tc+0 to tc+102: 6 requests, all 403**, shim count flat at 2.
+- The real `~/.env.aws` was written in place into the harness copy at tc+122.
+- **tr+1 to tr+469: 24 polls, all 403**, shim count flat at 2. Trigger 2 stayed silent
+  under the 100000s cooldown.
+- **tc+613 / tr+491: HTTP 200, shim count 3.** That is the first poll after the cache
+  expired, which the prediction put after tr+478. The re-read came 612s after req2's,
+  which is 600s within the 20s poll granularity, and well inside 900s of the rewrite.
+- Whole run: restarts 0, status running, exactly one flush line (from req1). The
+  harness copy was restored to the fabricated file on exit.
+
+So trigger 1 alone recovered a prolonged failing window without a restart, with
+trigger 2 held off. As in V10, the failures were AWS rejecting **invalid** fabricated
+credentials, not `ExpiredTokenException`; see [Outstanding](#outstanding).
+
+Log hygiene: `loggrep.sh` found 0 real credential values in production's 47 log lines
+and 0 in the harness counter directory. The harness's own `docker logs` were not
+counted, because `docker compose down` removed that container first.
 
 ## Production after the review fixes
 
@@ -499,10 +527,8 @@ reattached the shim mount, which an editor save had detached. Measured afterward
 
 ## Outstanding
 
-- **V4** — prolonged expired window; assert the trigger-1 bound specifically, so it
-  still passes if trigger 2 is broken. Blocked on VM memory, see
-  [V4, attempt 1](#v4-attempt-1--blocked-by-vm-memory). Pass: first 200 at the first
-  poll after tr+478, within 900s of the rewrite, with 1 flush line and no restart.
+- **The expired-token case end to end**, below. V4 passed on the invalid-credential
+  path in [attempt 2](#v4-attempt-2--pass).
 
 All runs above used one image,
 `ghcr.io/berriai/litellm@sha256:114aca7726c311915c8ea5120fcc44d32a0648c3ae3aec41a1014f0e846b16d1`,

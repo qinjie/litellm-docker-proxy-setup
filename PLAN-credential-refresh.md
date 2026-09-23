@@ -1,8 +1,8 @@
 # Plan: fast pickup of refreshed AWS credentials
 
-**Status:** implemented, not signed off. V4 is outstanding, blocked on VM memory, and
-the expired-token case end to end waits for the first real expiry. See
-[Outstanding](VERIFICATION-credential-refresh.md#outstanding).
+**Status:** implemented, not signed off. V4 passed on 2026-09-23, on invalid
+fabricated credentials; the expired-token case end to end waits for the first real
+expiry. See [Outstanding](VERIFICATION-credential-refresh.md#outstanding).
 **Date:** 2026-09-22
 **Revised:** 2026-09-22 — re-reads are now delayed rather than per-request, at the
 owner's direction. This reversed two earlier choices: `aws_profile_name` gave way
