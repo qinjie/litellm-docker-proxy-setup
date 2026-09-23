@@ -1,23 +1,42 @@
 model_list:
-  - model_name: claude-sonnet-4-5
+  - model_name: claude-sonnet-5
     litellm_params:
-      model: bedrock/global.anthropic.claude-sonnet-4-5-20250929-v1:0
-      aws_region_name: us-west-2
-  - model_name: claude-sonnet-4-6
-    litellm_params:
-      model: bedrock/global.anthropic.claude-sonnet-4-6
+      model: bedrock/global.anthropic.claude-sonnet-5
       aws_region_name: us-west-2
   - model_name: claude-haiku-4-5
     litellm_params:
       model: bedrock/global.anthropic.claude-haiku-4-5-20251001-v1:0
       aws_region_name: us-west-2
-  - model_name: claude-opus-4-5
+  - model_name: claude-opus-5-5
     litellm_params:
-      model: bedrock/global.anthropic.claude-opus-4-5-20251101-v1:0
+      model: bedrock/global.anthropic.claude-opus-5-5
       aws_region_name: us-west-2
-  - model_name: claude-opus-4-6
+  # Bedrock serves Fable only when the us-west-2 data-retention mode is aws_review (or
+  # the legacy provider_data_share): AWS retains prompts and outputs and may review
+  # them, without sharing them with Anthropic. Under inherit, every call here fails
+  # with a 400 "data retention mode 'default' is not available for this model".
+  - model_name: claude-fable-5-1
     litellm_params:
-      model: bedrock/global.anthropic.claude-opus-4-6-v1
+      model: bedrock/global.anthropic.claude-fable-5-1
+      aws_region_name: us-west-2
+  # converse/ is explicit on gpt-6-sol and gpt-6-luna because litellm picks the Bedrock
+  # route from its bedrock_converse_models list, and the current image lists neither;
+  # without the prefix they go to the invoke route. The other two are in that list.
+  - model_name: gpt-6-sol
+    litellm_params:
+      model: bedrock/converse/global.openai.gpt-6-sol
+      aws_region_name: us-west-2
+  - model_name: gpt-6-luna
+    litellm_params:
+      model: bedrock/converse/global.openai.gpt-6-luna
+      aws_region_name: us-west-2
+  - model_name: gpt-6-astra
+    litellm_params:
+      model: bedrock/global.openai.gpt-6-astra
+      aws_region_name: us-west-2
+  - model_name: gpt-5.6-terra
+    litellm_params:
+      model: bedrock/global.openai.gpt-5.6-terra
       aws_region_name: us-west-2
   - model_name: global.cohere.embed-v4:0
     litellm_params:

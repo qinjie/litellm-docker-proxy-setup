@@ -42,9 +42,24 @@ curl http://localhost:8000/health
 
 | Model Name | Bedrock Model ID |
 |------------|------------------|
-| claude-sonnet-4-5 | anthropic.claude-sonnet-4-5-20250929-v1:0 |
-| claude-haiku-4-5 | anthropic.claude-haiku-4-5-20251001-v1:0 |
-| claude-opus-4-5 | anthropic.claude-opus-4-5-20251101-v1:0 |
+| claude-sonnet-5 | global.anthropic.claude-sonnet-5 |
+| claude-haiku-4-5 | global.anthropic.claude-haiku-4-5-20251001-v1:0 |
+| claude-opus-5-5 | global.anthropic.claude-opus-5-5 |
+| claude-fable-5-1 | global.anthropic.claude-fable-5-1 |
+| gpt-6-sol | global.openai.gpt-6-sol |
+| gpt-6-luna | global.openai.gpt-6-luna |
+| gpt-6-astra | global.openai.gpt-6-astra |
+| gpt-5.6-terra | global.openai.gpt-5.6-terra |
+| global.cohere.embed-v4:0 | global.cohere.embed-v4:0 |
+
+`claude-fable-5-1` needs the account's Bedrock data-retention mode in `us-west-2` set
+to `aws_review` (the legacy `provider_data_share` also works). That lets AWS retain
+prompts and outputs and have AWS staff review them; they are not shared with
+Anthropic. The setting is per Region; AWS reviews content only for models whose
+provider requires it, so the other models here are unaffected. Under the default
+(`inherit`), every request to Fable returns a 400: `data retention mode 'default' is
+not available for this model`. Check the current mode with
+`aws bedrock get-account-data-retention --region us-west-2`.
 
 ## Testing
 
@@ -52,7 +67,7 @@ curl http://localhost:8000/health
 curl --location 'http://localhost:8000/chat/completions' \
 --header 'Content-Type: application/json' \
 --data '{
-  "model": "claude-sonnet-4-5",
+  "model": "claude-sonnet-5",
   "messages": [
     {
       "role": "user",
