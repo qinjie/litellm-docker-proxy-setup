@@ -13,7 +13,9 @@ AWS_SESSION_TOKEN=...
 
 `export` prefixes, quotes, full-line and inline comments, trailing whitespace, unrelated
 variables and CRLF line endings are all accepted, and a repeated name takes its last
-value. Do not export these into your own shell and expect the container to see them.
+value. The file must end with a newline: a read that stops mid-line is how a torn
+read shows up, so a file without one is refused. Do not export these into your own
+shell and expect the container to see them.
 `AWS_*` lines in `.env` are ignored. See [Credential refresh](#credential-refresh).
 
 ## Quick Start
@@ -271,6 +273,10 @@ level, not the logger's. Add `--detailed_debug` to the `litellm` command in
   refresh**: on Rancher Desktop the container sees the file as empty for about a
   second after each in-place rewrite. Nothing is cached, so retrying succeeds. If it
   persists, the file really is missing that line.
+- **HTTP 500, `aws-creds-shim: /app/env.aws does not end with a newline`**: once, just
+  after two rewrites of different length within about a second, it is a torn read;
+  nothing is cached, and the next request reads again. If it persists, the file was
+  written without a final newline; add one.
 - **`FileNotFoundError: ... '/app/aws-creds-shim.sh'`**: the shim was edited or
   pulled on the host, which detached its mount; run
   `docker compose up -d --force-recreate`. See

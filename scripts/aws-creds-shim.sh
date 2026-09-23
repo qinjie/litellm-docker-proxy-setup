@@ -71,7 +71,24 @@ esac
 # while reading it fails. So there is no readability precheck -- it would report
 # success on exactly the case worth catching. botocore surfaces this message verbatim
 # in CredentialRetrievalError, so it names the cause and the fix.
-CONTENTS=$(cat -- "$ENV_FILE" 2>/dev/null) || die "cannot read $ENV_FILE. If the host file was replaced rather than rewritten in place (mv, rm and recreate, or most editors), the bind mount is detached and only restarting or recreating the container reattaches it: run 'docker compose restart'. Note 'docker compose up -d' will not fix it -- on unchanged config and image it is a no-op and reports the container as Running."
+#
+# The trailing "x" keeps the file's final newline, which $(...) would strip.
+CONTENTS=$(cat -- "$ENV_FILE" 2>/dev/null && printf x) || die "cannot read $ENV_FILE. If the host file was replaced rather than rewritten in place (mv, rm and recreate, or most editors), the bind mount is detached and only restarting or recreating the container reattaches it: run 'docker compose restart'. Note 'docker compose up -d' will not fix it -- on unchanged config and image it is a no-op and reports the container as Running."
+
+# A snapshot that stops mid-line is a torn read, and must not be emitted: its last
+# value can be a truncated session token, which passes every presence check below
+# and only fails later, at AWS. Measured on Rancher Desktop (V5b): after two rewrites
+# of different length within about a second, the container reads the new contents
+# through the old file size, so the token is cut short and the final newline is
+# missing. Failing here caches nothing, and the next credential use reads again. An
+# empty snapshot is let through, so the empty view seen for about a second after a
+# rewrite still reports the missing field, as documented.
+case "$CONTENTS" in
+  x) CONTENTS= ;;
+  *'
+x') CONTENTS=${CONTENTS%x} ;;
+  *) die "$ENV_FILE does not end with a newline: either it was read mid-rewrite, which the next request retries, or it was written without a final newline, which must be added." ;;
+esac
 
 # Last assignment wins, so a file holding an old and a new value of the same name
 # yields the new one. After an optional opening quote, the value is cut at the first

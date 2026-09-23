@@ -27,9 +27,9 @@ Two containers were used:
 | V10d | A non-credential failure does not invalidate | PASS |
 | V10e | Matcher decision table, incl. `AccessDeniedException` | PASS |
 | V7 | Beyond repo files and `./logs`, only the credentials file is exposed; nothing else from `$HOME` | PASS |
-| V5 | Malformed input — 14 fixtures, host and in-container | PASS, after two fixes |
+| V5 | Malformed input — 14 fixtures, host and in-container | PASS, after three fixes |
 | V3 | Pickup without restarting the process | PASS |
-| V5b | Torn read under concurrent load | PASS for key-pair consistency; 1s stale view measured |
+| V5b | Torn read under concurrent load | PASS for key-pair consistency; truncated tokens rejected since review round 3; 1s stale view measured |
 | V10b | Recovery after an in-place rewrite | PASS — 70s |
 | V4 | Prolonged expired window, trigger-1 bound | blocked by VM memory; as predicted up to tr+389 |
 | V1 | Inode behaviour against the real container. **Release gate** | PASS |
@@ -187,6 +187,8 @@ no secret material in it:
 
 - `missing_token`, `empty_secret` — a name present but empty is treated as missing.
 - `torn_midwrite` (file truncated mid-value), `empty_file`, `garbage`.
+- `duplicate_no_trailing_newline` and `torn_midwrite`, since the third fix below —
+  with `does not end with a newline` rather than a variable name.
 - `space_after_equals` (`AWS_ACCESS_KEY_ID= ASIA...`) — the value is cut at the first
   whitespace, so it reads as empty and is rejected by name. Shell would not assign it
   either.
@@ -196,8 +198,8 @@ Accepted, emitting valid JSON:
 - `plain`; `exported_quoted` (`export` prefix, both `"` and `'` quoting);
   `indented_with_extras` (leading whitespace, comments, unrelated `AWS_REGION`).
 - `duplicate_no_trailing_newline` — **last assignment wins**, so a file containing an
-  old and a new value of the same name yields the new one, and a missing final newline
-  is fine.
+  old and a new value of the same name yields the new one. Accepted until the third
+  fix, which rejects it for the missing final newline; last-wins itself is unchanged.
 - `inline_comment` (`...=VALUE # note`) and `trailing_whitespace` — the value stops at
   the whitespace.
 - `special_chars` — the fabricated secret is `fake"quote\backslash`. It now comes out as
@@ -222,6 +224,17 @@ character after an optional opening quote. That one cut also drops the `\r`, so
 macOS is an unlikely source of CRLF, so this is a robustness fix rather than a live
 bug — but it is one line, and it converts an undiagnosable failure into correct
 behaviour.
+
+**The third fix**, from review round 3: the shim now rejects a snapshot that does not
+end with a newline, the torn-read signature measured in V5b below. In the image,
+2026-09-23: of the 14 fixtures, `duplicate_no_trailing_newline` changed from accepted
+to rejected and `torn_midwrite` from `AWS_SECRET_ACCESS_KEY missing` to the newline
+message. The other 12 are identical to the previous shim, with `Expiration` masked:
+7 accepted, 7 rejected. `empty_file` still reports `AWS_ACCESS_KEY_ID missing or
+empty`, so the 1s empty view keeps its documented message. The real `~/.env.aws` ends
+with a newline (checked by its last byte only). Production recreated at 03:08:22Z:
+the shim exits 0 on the real file, credentials resolve via `custom-process`, and a
+completion returned HTTP 200.
 
 ## V10b and V3 — in-place rewrite recovers in 70s, same process
 
@@ -274,9 +287,23 @@ What this means:
   second. It fails cleanly (`AWS_ACCESS_KEY_ID missing or empty`), nothing is cached,
   and the next request reads the new file.
 - **A truncated token needs two rewrites of different length within about 1s.** The
-  shim cannot detect it, because the token is non-empty and well-formed. It fails at
-  AWS as an invalid token, and trigger 2 then re-reads within the cooldown. So the
-  existing triggers bound it; it does not need a code change.
+  token is non-empty and well-formed, so no presence check catches it. As first
+  written, the shim emitted it, it failed at AWS as an invalid token, and trigger 2
+  re-read within the cooldown. Review round 3 did not accept that as a bound, since
+  the truncated credentials were cached and served until then. The snapshot ends
+  mid-token, without the file's final newline, so the shim now rejects it on that.
+
+Re-run 2026-09-23 with the same fabricated A/B generations, 1500 shim runs per row
+through a single-file bind mount in the image. The harness was rebuilt, so the
+truncation rate differs from the first run; the control row is the previous shim
+under the same harness:
+
+| Shim | Writer | Consistent | Clean error | Newline rejection | Truncated token emitted |
+|---|---|---|---|---|---|
+| previous (control) | 5 writes/s | 1362 | 134 | — | **4** (len 905) |
+| newline check | 5 writes/s | 1364 | 135 | 1 | 0 |
+| newline check | 5 writes/s | 1357 | 138 | 5 | 0 |
+| newline check | continuous | 14 | 1485 | 1 | 0 |
 
 The 1s figure is a Rancher Desktop (vz, virtiofs) property. Measure it again on any
 other Docker runtime.
