@@ -58,7 +58,8 @@ prompts and outputs and have AWS staff review them; they are not shared with
 Anthropic. The setting is per Region; AWS reviews content only for models whose
 provider requires it, so the other models here are unaffected. Under the default
 (`inherit`), every request to Fable returns a 400: `data retention mode 'default' is
-not available for this model`. Check the current mode with
+not available for this model`, and `/health` lists it under `unhealthy_endpoints`
+(the endpoint still returns 200). Check the current mode with
 `aws bedrock get-account-data-retention --region us-west-2`.
 
 ## Testing
