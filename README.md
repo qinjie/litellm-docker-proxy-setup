@@ -120,7 +120,12 @@ Things worth knowing before changing any of this:
   passes through only `LITELLM_CREDS_REREAD_DELAY` and
   `LITELLM_CREDS_ERROR_REREAD_COOLDOWN`, so `AWS_*` lines left in an old `.env` are
   inert. Adding one to `environment:` in the compose file or an override brings the
-  problem back. Check with names only:
+  problem back. The flip side is that any *other* setting kept in `.env` must also be
+  added to `environment:` by name, or it never reaches the container. Proxy auth is
+  not one of those today: `litellm_config.yaml` declares `master_key` empty, which
+  outranks `LITELLM_MASTER_KEY`, so auth is off with or without `.env` (measured on
+  1.103.0). To enable it, set `master_key: os.environ/LITELLM_MASTER_KEY` and pass
+  that name through. Check with names only:
 
 ```bash
 docker compose exec litellm sh -c 'printenv | cut -d= -f1 | sort' | grep '^AWS_'

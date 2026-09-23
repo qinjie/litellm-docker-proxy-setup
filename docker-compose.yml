@@ -19,6 +19,12 @@ services:
       # so the defaults in the shim and the callback apply. See .env.sample.
       - LITELLM_CREDS_REREAD_DELAY
       - LITELLM_CREDS_ERROR_REREAD_COOLDOWN
+      # Any other setting kept in .env must be added here by name, or it is silently
+      # dropped. That includes LITELLM_MASTER_KEY -- which on its own would still do
+      # nothing: litellm_config.yaml declares general_settings.master_key empty, and an
+      # empty key in the config outranks the env var, so auth is off either way. To
+      # turn it on, set master_key: os.environ/LITELLM_MASTER_KEY there and add the
+      # name here.
     volumes:
       - ./litellm_config.yaml:/app/config.yaml:ro
       - ./logs:/app/logs # persist logs locally
