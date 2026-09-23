@@ -586,7 +586,7 @@ Measurements and status live in
   should hold by construction; run it anyway, since it is the guard that proves
   the chosen shape actually delivers that.
 - **V6 — baseline.** `curl -f http://localhost:8000/health` passes and a
-  completion against `claude-sonnet-4-5` succeeds.
+  completion against `claude-sonnet-5` succeeds.
 - **V7 — mount surface.** Inspect the running container's mounts and confirm that,
   apart from this repo's own files and `./logs`, the only host path exposed is the
   credentials file or its dedicated directory. Specifically assert `~/.aws`, `~/.ssh`
