@@ -1,5 +1,11 @@
 # Use AWS Bedrock Claude Models with Your Favorite Tools via LiteLLM Proxy
 
+> **Note:** this article walks through the original setup, which passes AWS credentials
+> in as environment variables and needs the container recreated after every refresh.
+> This repo's `docker-compose.yml` no longer works that way: it reads `~/.env.aws` while
+> running, and AWS credentials in the environment would stop that. Follow
+> [README.md](README.md) for this repo.
+
 **Blurb:** Have AWS Bedrock access but your tools expect OpenAI's API format? Can't use public LLM APIs due to company restrictions? This quick guide shows you how to set up a local LiteLLM proxy that lets you use Bedrock's Claude models with any OpenAI-compatible application—while keeping your data securely within AWS.
 
 ---

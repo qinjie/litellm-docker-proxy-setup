@@ -32,6 +32,13 @@ litellm_settings: # module level litellm settings - https://github.com/BerriAI/l
   #   top_k: 5
   #   similarity_threshold: 0.3
 
+  # Re-read the AWS credentials file when AWS rejects the credentials in use,
+  # instead of waiting out the scheduled re-read. See scripts/aws_credential_refresh.py.
+  # No model entry may set an aws_* credential param: that switches litellm to an
+  # uncached code path, which removes both the schedule and anything for this callback
+  # to invalidate.
+  callbacks: ["aws_credential_refresh.aws_credential_refresh_instance"]
+
   drop_params: true
   cache: true
   cache_params:

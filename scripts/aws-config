@@ -1,2 +1,6 @@
 [profile bedrock]
 credential_process = /app/aws-creds-shim.sh
+# Set here rather than as AWS_DEFAULT_REGION so no AWS region variable needs to exist
+# in the container environment. Every model in litellm_config.yaml also sets
+# aws_region_name explicitly; this only covers a path that does not.
+region = us-west-2

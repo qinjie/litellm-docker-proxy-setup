@@ -1,6 +1,8 @@
 # Plan: fast pickup of refreshed AWS credentials
 
-**Status:** proposed
+**Status:** implemented, not signed off. V4 is outstanding, blocked on VM memory, and
+the expired-token case end to end waits for the first real expiry. See
+[Outstanding](VERIFICATION-credential-refresh.md#outstanding).
 **Date:** 2026-09-22
 **Revised:** 2026-09-22 — re-reads are now delayed rather than per-request, at the
 owner's direction. This reversed two earlier choices: `aws_profile_name` gave way
@@ -15,7 +17,9 @@ credential provider rather than as a timer, for reasons recorded under trigger 1
 process restart**, instead of up to 300s later plus a restart. Two re-read
 triggers, per the owner's direction:
 
-1. **Scheduled** — re-read at least every 15 minutes, unconditionally.
+1. **Scheduled** — re-read on the first credential use once 15 minutes have passed
+   since the last read. Request-driven, not a timer: an idle proxy reads nothing, and
+   the first request after an idle gap re-reads.
 2. **On error** — re-read when a request to the LLM fails with a credential
    rejection, rather than waiting out the schedule.
 
@@ -36,14 +40,22 @@ so it cannot be run on a timer. Two consequences shape the design:
 - Credentials in `~/.env.aws` may be **expired for an unbounded period**, from
   the moment they lapse until a person happens to refresh them. Requests during
   that window cannot be rescued; no valid credentials exist.
-- The property that matters is therefore: **the first request issued after the
-  file is rewritten must succeed, with no restart and no operator action beyond
-  the refresh itself.** Latency is measured from the file changing, not from
-  expiry.
+- The property that matters is therefore: **after the file is rewritten, the proxy
+  uses the new credentials with no restart and no operator action beyond the refresh
+  itself, within a bounded delay** — at most `REREAD_DELAY` (trigger 1), or one
+  failed request after `ERROR_REREAD_COOLDOWN` (trigger 2), whichever comes first.
+  The first request after the rewrite is **not** required to succeed. It may be
+  served from credentials cached before the rewrite, and its failure is what arms
+  trigger 2. This replaces an earlier "first request must succeed" criterion, which
+  the owner's requirement of a delay before re-reading (2026-09-22) superseded.
+  Latency is measured from the file changing, not from expiry.
 - Re-reading the file on every request during that window is pure churn — nothing
   the container can do makes expired credentials work, and only a person can
-  change that. So the file is re-read on a **delay**, at most once per
-  `REREAD_DELAY`, not once per failed request.
+  change that. So the file is re-read on a **delay**, not once per failed request:
+  on the schedule at most once per `min(600, REREAD_DELAY)` (litellm's cache TTL
+  and the shim's interval, whichever is shorter), plus at most one cache-drop
+  attempt per `ERROR_REREAD_COOLDOWN` per worker process while AWS is rejecting
+  requests. A successful drop makes the next request re-read.
 - A credential rejection is nonetheless the **strongest available signal** that the
   file is worth re-reading, so it triggers one too — bounded by its own cooldown,
   which is what keeps "re-read on error" from collapsing back into "re-read per
@@ -53,8 +65,7 @@ One precondition on the no-operator-action property, stated here because it
 constrains the whole design: it holds when the file is rewritten **in place**. A
 writer that *replaces* the file detaches the bind mount, and no container-side work
 can recover from that — it takes either one manual restart or a different mount
-shape. Which of the two the host script does is the open question below, and it
-gates calling this work done.
+shape. The host script rewrites in place (answered below), so the precondition holds.
 
 The proxy must also not degrade during the expired window: it should keep
 failing cleanly per request and remain ready, rather than restart-looping or
@@ -215,7 +226,10 @@ One consequence worth stating: re-reads are **lazy** — driven by a request arr
 not by a clock. Idle proxy, no re-reads. That is not a gap: the first request after
 any idle gap longer than the interval re-reads before it authenticates, because the
 window has already elapsed. Credentials are only needed at request time, so a timer
-firing into an idle process would buy nothing.
+firing into an idle process would buy nothing. The compose healthcheck is not such a
+request: it runs `curl`, which the image lacks, so it never reaches `/health`
+(measured 2026-09-23: `unhealthy`, the exec itself failing, 42 in a row). A client
+that does call `/health` is one, since litellm's `/health` calls every model.
 
 No expiry comparison and no floor: there is nothing in the file to compare
 against, and a timestamp this far ahead is never in the past. The earlier
@@ -228,10 +242,14 @@ Consequences, stated plainly:
   `ExpiredTokenException`. That *is* the expiry detection; the container has no
   local means of detecting it, and does not need one.
 - A refreshed file is picked up within `REREAD_DELAY`, with no restart.
-- Re-read cost drops from one subprocess per request to one per `REREAD_DELAY`.
+- Re-read cost drops from one subprocess per request to one per
+  `min(600, REREAD_DELAY)`, plus at most one per `ERROR_REREAD_COOLDOWN` while AWS
+  is rejecting requests.
 - Refresh now lands in botocore's *advisory* window rather than its 10-minute
-  *mandatory* one, so an unreadable file no longer fails the request: botocore
-  logs a warning and keeps serving what it holds. Acceptable exactly because the
+  *mandatory* one, so an unreadable file no longer fails an advisory refresh of
+  credentials botocore already holds: it logs a warning and keeps serving them. A
+  fresh session has nothing to serve, so there an unreadable file still fails the
+  request with HTTP 500. That happens after litellm's cache TTL or a cache drop. Acceptable exactly because the
   timestamp was never a validity claim — if those credentials are good the request
   succeeds, and if they are expired AWS rejects it. This reverses an earlier
   preference for the mandatory window, which assumed per-fetch re-reads.
@@ -259,9 +277,10 @@ Four constraints on that hook, each load-bearing:
 - **Cooldown, or this becomes per-request churn.** During an expired window *every*
   request fails, so an unguarded hook would invalidate on every one of them and
   re-read the file per request — exactly the behaviour this plan exists to remove.
-  At most one error-triggered re-read per `ERROR_REREAD_COOLDOWN` (default 60s),
-  held as a monotonic timestamp in the callback module. A burst of N failures
-  produces one re-read.
+  At most one cache-drop attempt per `ERROR_REREAD_COOLDOWN` (default 60s) per
+  worker process, held as a monotonic timestamp in the callback module. A burst of
+  N failures produces one attempt; a successful drop makes the next request re-read,
+  and a failed one re-reads nothing.
 - **Narrow the trigger to credential rejections.** Match `ExpiredToken`,
   `ExpiredTokenException`, `InvalidClientTokenId`, `UnrecognizedClientException`.
   Not `AccessDeniedException` — that is a policy problem, and re-reading the file
@@ -325,7 +344,8 @@ old contents:
 | `docker compose up -d` after either | reports `Running`, **still broken** |
 
 So replacement fails **loudly and recoverably**, not silently, and the shim already
-handles it: `cat` fails and it dies with `failed to read <path>`. Note that
+handles it: `cat` fails and it dies with `cannot read <path>` plus the recovery
+command. Note that
 `[ -r "$ENV_FILE" ]` returns *true* on a detached mount — the readability precheck
 is not what catches this, the `cat` failure is, and the precheck must not be
 trusted to.
@@ -334,7 +354,9 @@ That error reaches the operator rather than being buried: botocore carries a fai
 credential process's stderr verbatim into `CredentialRetrievalError` (measured:
 `Error when retrieving credentials from custom-process: aws-creds-shim: ...`), and
 litellm builds a fresh session each cache TTL, so within ~600s of a replacement a
-request fails with the shim's own message.
+request fails with the shim's own message. The client sees it as HTTP 500,
+`litellm.APIConnectionError`, carrying that text; `CredentialRetrievalError` appears
+only in the container log.
 
 Caveat on the measurement: that is the Mac file-sharing path. On native-Linux Docker
 the classic pinned-inode semantics may apply instead, and replacement there *would*
@@ -347,8 +369,9 @@ fields are present but come from different generations** — a new `AccessKeyId`
 paired with an old `SecretAccessKey`. That passes a presence check and would be
 emitted as valid, producing a confusing signature failure rather than a clean
 error. The delayed-re-read design shrinks this exposure considerably compared with
-per-request reads: there is at most one reader per `REREAD_DELAY` per cache entry,
-so the odds of landing inside a rewrite window are small. Small is not zero, and
+per-request reads: there is at most one reader per `min(600, REREAD_DELAY)` per
+cache entry on the schedule, plus one per `ERROR_REREAD_COOLDOWN` while AWS is
+rejecting requests, so the odds of landing inside a rewrite window are small. Small is not zero, and
 the window is still only closed by an atomic replace on the writing side.
 
 ### Hard constraint: `$HOME` must never be mounted
@@ -413,8 +436,8 @@ Hence **V1 is a release gate, not a curiosity**:
   it lands.
 
 So the dedicated directory is deferred only in *sequence*, never in *scope*: V1
-decides whether it is unnecessary or mandatory, and until V1 runs, this plan is
-provisional on the answer. What it is **not** is optional — nothing here approves a
+decides whether it is unnecessary or mandatory. V1 has run: the writer rewrites in
+place, so it is unnecessary. What it is **not** is optional — nothing here approves a
 setup that needs a restart on every refresh.
 
 The shim must also be safe under concurrent invocation in its own right: no
@@ -439,9 +462,12 @@ not shipped.
    now a revision of an existing file, not new work.**
 2. `scripts/aws-config` — single profile with `credential_process`. Done.
 3. `docker-compose.yml` — mount shim, AWS config **and the callback module**, set
-   `AWS_CONFIG_FILE` **and `AWS_PROFILE`**, put the callback's directory on
-   `PYTHONPATH` so litellm can import it, keep the existing single-file credentials
-   mount, and stop supplying AWS credentials via `env_file`. No `AWS_ACCESS_KEY_ID`,
+   `AWS_CONFIG_FILE` **and `AWS_PROFILE`**, and keep the existing single-file
+   credentials mount. The callback is mounted beside `config.yaml`, not put on
+   `PYTHONPATH`: litellm resolves a callback string against the config's directory
+   first. Drop `env_file` entirely and pass through only the two `LITELLM_CREDS_*`
+   settings by name, so `AWS_*` lines in an existing `.env` (the old sample had them)
+   cannot reach the container. No `AWS_ACCESS_KEY_ID`,
    `AWS_SECRET_ACCESS_KEY` or `AWS_SESSION_TOKEN` may remain in the container
    environment: botocore's env provider outranks the profile and would shadow the
    shim entirely. Mounting `$HOME` (or any parent of it) is prohibited.
@@ -450,9 +476,10 @@ not shipped.
    credential-rejection codes, enforce `ERROR_REREAD_COOLDOWN` (default 60s) via a
    monotonic clock, resolve `BaseAWSLLM._shared_iam_cache` defensively and
    `flush_cache()` it. Must never raise into the caller's path, never log credential
-   values, and log the reason whenever it declines to act (cooldown active, code not
-   matched, cache attribute missing) — silent no-ops here are indistinguishable from
-   success. Expose a module-level instance for the config to reference.
+   values, and log the reason whenever it declines to act (cooldown active at info,
+   code not matched at debug with the exception type name only, cache attribute
+   missing at error) — silent no-ops here are indistinguishable from success. Only
+   the error line is visible without `--detailed_debug`. Expose a module-level instance for the config to reference.
 5. `litellm_config.yaml` — register the callback under `litellm_settings.callbacks`.
    No model entry changes; verify no entry sets an `aws_*` credential param, since
    that is what keeps every model on the cached ambient-credentials branch — and
@@ -468,7 +495,8 @@ not shipped.
    per-request re-reads and disables trigger 2. Record that trigger 2 depends on a
    private litellm attribute, so an image update warrants re-running V10. Document the single-file mount caveat as a **procedure**,
    not just a warning: if the credentials file is replaced rather than rewritten in
-   place, requests fail with `CredentialRetrievalError` naming the shim, and
+   place, requests fail with HTTP 500 (`litellm.APIConnectionError`) carrying the
+   shim's message, and
    `docker compose restart` is the recovery — and say why `up -d` is not, since
    that is the command an operator will reach for first. If V1 shows the writer
    replaces the inode, that procedure is not the answer and the dedicated directory
@@ -479,15 +507,15 @@ not shipped.
 
 Runtime evidence required; source inspection is not sufficient.
 
-- **V1 — inode behaviour. Release gate.** Partly answered above, measured on Rancher
-  Desktop: an in-place rewrite is visible to the container, and a replacement makes
-  the mounted path unreadable until the container is recreated. What remains is which
-  of the two the host refresh script does, and a re-run on native Linux if this ever
-  moves there. Repeat against the real litellm container once it is up, and confirm
-  the detached-mount failure surfaces as a request error carrying the shim's message.
-  A "replaces" result makes the dedicated directory a required task, per the mount
-  decision above; this verification therefore cannot be skipped or deferred past
-  completion.
+Measurements and status live in
+[VERIFICATION-credential-refresh.md](VERIFICATION-credential-refresh.md), not here.
+
+- **V1 — inode behaviour. Release gate. PASS**, on Rancher Desktop. An in-place
+  rewrite is visible to the container, and a replacement makes the mounted path
+  unreadable until the container is restarted. The host refresh script rewrites in
+  place, and on the real container the detached-mount failure surfaces as a request
+  error carrying the shim's message. So the dedicated directory stays a follow-up.
+  Re-run on native Linux if this ever moves there.
 - **V9 — the scheduled interval, measured.** The central check for trigger 1. Have the
   shim append a timestamp to a counter file, issue N requests inside one interval, and
   confirm the invocation count is ~1, not N. Then run across several intervals and
@@ -499,8 +527,10 @@ Runtime evidence required; source inspection is not sufficient.
 - **V10 — trigger 2 fires, and only when it should.** Four parts, because the hook
   fails silently (litellm swallows its exceptions). (a) With expired credentials in
   the file, issue one request, confirm it fails at AWS, then confirm a shim invocation
-  follows the failure rather than the schedule — the counter advances within seconds,
-  not 600s. (b) Rewrite the file with valid credentials during an expired window and
+  follows the failure rather than the schedule — the counter advances on the **next
+  request**, not 600s later. The flush is lazy: dropping the cache entry does not
+  itself re-resolve anything, so there is no invocation to observe until something asks
+  for credentials again. (b) Rewrite the file with valid credentials during an expired window and
   confirm the **next** request after the cooldown succeeds, well inside one scheduled
   interval; this is the whole point of the trigger. (c) Issue a burst of N failing
   requests inside one `ERROR_REREAD_COOLDOWN` and confirm exactly one extra
@@ -550,24 +580,17 @@ Runtime evidence required; source inspection is not sufficient.
   the chosen shape actually delivers that.
 - **V6 — baseline.** `curl -f http://localhost:8000/health` passes and a
   completion against `claude-sonnet-4-5` succeeds.
-- **V7 — mount surface.** Inspect the running container's mounts and confirm the
-  only host path exposed is the credentials file or its dedicated directory.
-  Specifically assert `~/.aws`, `~/.ssh` and `~/.midway` are **not** reachable
-  from inside the container.
+- **V7 — mount surface.** Inspect the running container's mounts and confirm that,
+  apart from this repo's own files and `./logs`, the only host path exposed is the
+  credentials file or its dedicated directory. Specifically assert `~/.aws`, `~/.ssh`
+  and `~/.midway` are **not** reachable from inside the container.
 
-## Open question
+## Open question — answered: the script rewrites in place
 
-**The write strategy of the host refresh script** — in-place rewrite, or inode
-replacement (`mv`, delete-and-recreate)? Only the first is safe on a single-file bind
-mount. Note that hand-editing the file in most editors also replaces the inode.
-
-This does not block tasks 3-5, which build against the existing mount either way. It
-does gate **completion**: it is the input to V1, and per the mount decision a
-"replaces" answer makes the dedicated directory a required task rather than a
-follow-up. So the plan cannot be signed off without it.
-
-Searching the machine did not find the script (`~/bin`, `~/.local/bin`, shell config,
-and history all show only reads of `~/.env.aws`, plus one `rm`), so it cannot be read
-rather than guessed — its owner has to answer. Failing that, V1 can be settled
-empirically: refresh once for real, then check whether the mounted path inside the
-container is still readable.
+Settled empirically on 2026-09-23. After a real refresh at 09:01:48, the running
+container's `/app/env.aws` hash-matched the host file with no restart in between, so
+the single-file mount stays and the dedicated directory remains a follow-up, not a
+required task. Evidence is in
+[VERIFICATION-credential-refresh.md](VERIFICATION-credential-refresh.md#v1--what-the-real-container-showed).
+Hand-editing the file in most editors still replaces the inode. The README covers
+recovery from that.

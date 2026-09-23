@@ -5,15 +5,35 @@ services:
     restart: unless-stopped
     ports:
       - "8000:4000"
-    env_file:
-      - .env
+    # No env_file. botocore's environment provider outranks the profile below, so an
+    # AWS_ACCESS_KEY_ID in the container -- even an empty one, as the old .env.sample
+    # had -- silently wins and the credential_process shim is never consulted. .env is
+    # still read, but only for the two names passed through at the end of this list.
     environment:
-      - ENV_RELOAD_INTERVAL=300 # check for env file changes every 5 minutes
-      - ENV_RELOAD_COOLDOWN=30 # min seconds between reloads to avoid rapid loops
+      # Credentials resolve through the profile in scripts/aws-config, whose
+      # credential_process is the shim. AWS_CONFIG_FILE is set explicitly so this
+      # works regardless of which user the image runs as.
+      - AWS_CONFIG_FILE=/app/aws-config
+      - AWS_PROFILE=bedrock
+      # Taken from .env or the shell by name; left out of the container when unset,
+      # so the defaults in the shim and the callback apply. See .env.sample.
+      - LITELLM_CREDS_REREAD_DELAY
+      - LITELLM_CREDS_ERROR_REREAD_COOLDOWN
     volumes:
       - ./litellm_config.yaml:/app/config.yaml:ro
       - ./logs:/app/logs # persist logs locally
       - ./entrypoint.sh:/app/entrypoint.sh:ro
+      - ./scripts/aws-creds-shim.sh:/app/aws-creds-shim.sh:ro
+      - ./scripts/aws-config:/app/aws-config:ro
+      # Beside config.yaml, not on PYTHONPATH: litellm resolves a callback string by
+      # looking for <dirname of config>/<module>.py first, and only falls back to a
+      # normal import. Mounting it here uses the primary path and needs no env var.
+      - ./scripts/aws_credential_refresh.py:/app/aws_credential_refresh.py:ro
+      # Single file, not the containing directory: ~/.env.aws sits directly in $HOME,
+      # so mounting its directory would expose ~/.aws, ~/.ssh and ~/.midway to the
+      # container. The cost is that replacing the file on the host (mv, rm and
+      # recreate, or most editors) detaches this mount until the container is
+      # restarted -- rewrite it in place, or recover with `docker compose restart`.
       - ~/.env.aws:/app/env.aws:ro
     entrypoint: ["/app/entrypoint.sh"]
     healthcheck:
