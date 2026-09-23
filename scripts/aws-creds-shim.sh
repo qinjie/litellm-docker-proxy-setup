@@ -9,10 +9,12 @@ ENV_FILE="${LITELLM_AWS_ENV_FILE:-/app/env.aws}"
 # botocore's advisory refresh window
 # (RefreshableCredentials._advisory_refresh_timeout). Once the remaining lifetime of
 # the emitted credentials falls inside this window, botocore re-invokes this shim on
-# the next credential use -- which is the only reason a re-read happens at all. It
-# has been 900s for years, but the image tracks a moving tag, so V8 asserts it
-# against the running container.
-ADVISORY_WINDOW=900
+# the next credential use -- which is the only reason a re-read happens at all.
+# The image tracks a moving tag, so entrypoint.sh reads the value from the installed
+# botocore at startup and exports it. 900 is the value in botocore 1.43.6 and the
+# fallback when that read fails (entrypoint.sh logs a warning) or when the shim is
+# run by hand -- `docker compose exec` does not inherit the entrypoint's environment.
+ADVISORY_WINDOW="${LITELLM_CREDS_ADVISORY_WINDOW:-900}"
 
 # Interval between scheduled re-reads, and therefore the worst-case lag between a
 # person rewriting ENV_FILE and the proxy using the new contents. Placing Expiration
@@ -53,6 +55,11 @@ esac
   die "LITELLM_CREDS_REREAD_DELAY must be >= $REREAD_DELAY_MIN, got: $REREAD_DELAY"
 [ "$REREAD_DELAY" -le "$REREAD_DELAY_MAX" ] ||
   die "LITELLM_CREDS_REREAD_DELAY must be <= $REREAD_DELAY_MAX, got: $REREAD_DELAY"
+
+# entrypoint.sh exports only a validated positive integer, so this is defensive.
+case "$ADVISORY_WINDOW" in
+  '' | *[!0-9]* | 0*) die "LITELLM_CREDS_ADVISORY_WINDOW must be a positive integer, got: $ADVISORY_WINDOW" ;;
+esac
 
 # One snapshot, and every field is parsed from it, so a concurrent rewrite cannot
 # hand back an access key and a secret key from different generations. This

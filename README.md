@@ -109,10 +109,13 @@ Things worth knowing before changing any of this:
   has nothing to derive real expiry from (`~/.env.aws` carries no expiry field), and
   AWS is the authority on whether credentials work. Expired credentials fail at AWS
   with `ExpiredTokenException`; that *is* the detection.
-- **It assumes botocore's advisory refresh window is 900s.** The shim places
-  `Expiration` at `now + 900 + REREAD_DELAY` so that the remaining lifetime lands
-  inside that window and botocore re-invokes it. If a future botocore changes the
-  window, re-reads happen on a different interval than the variable says.
+- **It depends on botocore's advisory refresh window, read at startup.** The shim
+  places `Expiration` at `now + window + REREAD_DELAY` so that the remaining
+  lifetime lands inside that window after `REREAD_DELAY` and botocore re-invokes it.
+  `entrypoint.sh` reads the window from the installed botocore (900s on 1.43.6) and
+  logs `entrypoint: botocore advisory refresh window is 900s`. If botocore's
+  internals move and the read fails, it logs a `WARNING` instead, and the shim
+  assumes 900s, so a changed window would move the interval off the variable.
 - **Never put AWS credentials in the container environment.** botocore's
   environment provider outranks the profile, so a stray `AWS_ACCESS_KEY_ID` — even
   empty — silently wins, the shim is never called, and the proxy is pinned to

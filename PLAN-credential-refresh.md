@@ -314,12 +314,15 @@ update. Trigger 1 keeps working regardless, which bounds the damage to "back to 
 
 ### Risk: `ADVISORY_WINDOW` is a botocore constant, not a contract
 
-The formula hardcodes botocore's 15-minute advisory window
-(`_advisory_refresh_timeout`). It has been 900s for years, but the image pins
-`main-latest`, so its botocore can move. If that window ever **shrinks**, re-reads
-happen later than `REREAD_DELAY` promises, silently — e.g. a 600s window with
-`REREAD_DELAY = 60s` would re-read every 360s. V8 asserts the constant in the
-running image, and the README must name the assumption.
+The formula depends on botocore's advisory window (`_advisory_refresh_timeout`,
+900s in 1.43.6), and the image tracks `main-latest`, so its botocore can move.
+A shim that hardcoded 900 would, if the window ever **shrank**, re-read later
+than `REREAD_DELAY` promises, silently — e.g. a 600s window with
+`REREAD_DELAY = 60s` would re-read every 360s. So `entrypoint.sh` reads the
+window at startup from credentials built the way `ProcessProvider` builds them,
+and exports it to the shim as `LITELLM_CREDS_ADVISORY_WINDOW`. What remains is
+the read itself failing, because the private attribute moved: then the entrypoint
+logs a warning and the shim falls back to 900.
 
 ## Risk: how the file is written, and torn reads under concurrency
 
@@ -484,9 +487,10 @@ not shipped.
    No model entry changes; verify no entry sets an `aws_*` credential param, since
    that is what keeps every model on the cached ambient-credentials branch — and
    trigger 2 has nothing to invalidate without it.
-6. `entrypoint.sh` — reduce to `exec litellm`. This also removes the startup
-   `source` of the credentials file, which is required, not incidental: those
-   exported variables would otherwise shadow the profile.
+6. `entrypoint.sh` — reduce to reading botocore's advisory window (exported as
+   `LITELLM_CREDS_ADVISORY_WINDOW`, warning if unreadable) and `exec litellm`. This
+   also removes the startup `source` of the credentials file, which is required,
+   not incidental: those exported variables would otherwise shadow the profile.
 7. `README.md` — document **both triggers**, quote the V9 measured re-read interval
    rather than the nominal 900s (it will be ~600s, and say why: litellm's
    non-configurable credential cache TTL), state the `ADVISORY_WINDOW = 900s`

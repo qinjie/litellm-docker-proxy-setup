@@ -41,6 +41,16 @@ Read out of the running image rather than out of botocore's source:
 - `RefreshableCredentials._advisory_refresh_timeout` = **900** — the shim's
   `ADVISORY_WINDOW` matches, so `Expiration = now + 900 + REREAD_DELAY` does land
   inside the window and does cause re-invocation.
+  - Since review round 2 the shim no longer hardcodes it: `entrypoint.sh` reads it
+    at startup and exports `LITELLM_CREDS_ADVISORY_WINDOW`. In the image, 2026-09-23:
+    the read logged `entrypoint: botocore advisory refresh window is 900s`; with
+    `python` stubbed to fail it logged the `WARNING` and left the variable unset.
+    Shim `Expiration - now` = window + `REREAD_DELAY`: 1800 with the variable unset,
+    900 or empty; 1200 at 300; 360 at 300 with a delay of 60. `abc` and `0900` are
+    rejected. The 14 V5 fixtures give output identical to the previous shim, with
+    `Expiration` masked. Production after recreate at 02:50:29Z: litellm's PID 1 carries
+    `LITELLM_CREDS_ADVISORY_WINDOW=900`, credentials resolve via `custom-process`,
+    and a completion returned HTTP 200 in 1.33s.
 - `RefreshableCredentials._mandatory_refresh_timeout` = **600**.
 - `BaseAWSLLM._shared_iam_cache` is a `DualCache` with a callable `flush_cache`, and
   its `in_memory` `default_ttl` is **600** — the second cache in the series, and the
@@ -52,7 +62,7 @@ Read out of the running image rather than out of botocore's source:
 ## V4b — the profile is actually in use
 
 `printenv | cut -d= -f1 | sort` inside the production container (names only — a bare
-`env` would print the master key and database URL) returns exactly `AWS_CONFIG_FILE`
+`env` prints every value) returns exactly `AWS_CONFIG_FILE`
 and `AWS_PROFILE` from the `AWS_` family. No `AWS_ACCESS_KEY_ID`,
 `AWS_SECRET_ACCESS_KEY` or `AWS_SESSION_TOKEN`, so botocore's environment provider
 cannot shadow the profile. Corroborated by V9: the counter advances at all, which only
